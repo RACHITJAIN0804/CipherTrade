@@ -1,0 +1,59 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+backend/.venv/
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/dist/
+backend/build/
+backend/*.egg-info/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/htmlcov/
+backend/.coverage
+backend/coverage.xml
+
+# ─── Node / Frontend ──────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+.env
+**/.env
+!**/.env.example
+*.pem
+*.key
+*.p12
+id_rsa
+id_ed25519
+**/keystore/
+**/secrets/
+
+# ─── Blockchain Artifacts ─────────────────────────────────────────────────────
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+
+# ─── Databases & Logs ─────────────────────────────────────────────────────────
+*.db
+*.sqlite3
+*.log
+logs/
+
+# ─── OS & Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+
+# ─── Build Outputs ────────────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo

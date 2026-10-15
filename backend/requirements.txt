@@ -1,0 +1,15 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+pydantic>=2.14.0
+pydantic-settings>=2.9.1
+python-dotenv==1.1.0
+sqlalchemy==2.0.40
+alembic==1.15.2
+# asyncpg requires MSVC (Windows) or gcc (Linux/macOS) to build from source.
+# On Python 3.14 there are no pre-built wheels yet; install via requirements-ci.txt on CI.
+asyncpg==0.30.0
+websockets==15.0.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.20
+httpx==0.28.1

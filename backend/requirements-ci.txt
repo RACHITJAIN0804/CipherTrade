@@ -1,0 +1,15 @@
+# Minimal requirements for running tests without a native compiler toolchain.
+# These packages are either pure-Python or have pre-built cp314 wheels.
+# Use requirements.txt for full production installs (requires MSVC + Rust for asyncpg).
+fastapi==0.115.12
+pydantic>=2.14.0          # 2.14+ ships cp314 binary wheels for pydantic-core
+pydantic-settings>=2.9.1
+python-dotenv==1.1.0
+starlette==0.46.2
+httpx==0.28.1
+anyio==4.9.0
+
+# Test dependencies
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-cov==6.1.0
