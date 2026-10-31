@@ -1,6 +1,6 @@
 # CipherTrade — Architecture Document
 
-> **Status:** Phase 1 scaffold. Updated as each phase is completed.
+> **Status:** Phase 2 — Smart-contract escrow implemented and tested. Updated as each phase is completed.
 
 ---
 
@@ -49,7 +49,9 @@
 | Data | Rationale |
 |---|---|
 | Escrow deal ID, buyer, seller, amount | Trustless settlement; requires immutability |
-| Deal state transitions (events) | Audit trail for dispute resolution |
+| Deal deadline (Unix timestamp) | Enables trustless buyer cancellation without off-chain coordination |
+| agreementHash (keccak256) | Cryptographic fingerprint of off-chain deal terms; integrity check without exposing content |
+| Deal state transitions (events) | Immutable audit trail for dispute resolution |
 
 ---
 
@@ -149,43 +151,75 @@ The messaging system will be modelled on the **Signal Protocol**:
 ## 5. Escrow Transaction Lifecycle
 
 ```
-State machine for CipherTradeEscrow.sol
+State machine: CipherTradeEscrow.sol (Phase 2)
 
-  fundDeal()         confirmDelivery()     withdrawPayment()
-FUNDED ──────────────────▶ CONFIRMED ──────────────────▶ RELEASED
-  │                                                        (terminal)
-  │  refundBuyer()
-  └──────────────────────────────────────────────────────▶ REFUNDED
-  │                                                        (terminal)
-  │  raiseDispute()
-  └──────────────────────────────────────────────────────▶ DISPUTED
-                                                            │
-                                          [Phase 4 arbitration]
-                                                            │
-                                                         RESOLVED
-                                                          (terminal)
+                  fundDeal()
+  (none) ──────────────────────────► FUNDED
+                                       │
+           confirmDelivery()           │  cancelExpired()  [after deadline]
+                (buyer)               │      (buyer)
+                   │                  ▼
+                   │            CANCELLED ◄─────────────────────────────┐
+                   │                                                     │
+                   │                 raiseDispute()                      │
+                   ▼    (buyer│seller)                                   │
+              CONFIRMED ──────────────────► DISPUTED                    │
+                   │                           │                        │
+       withdrawPayment()         resolveDispute() (arbitrator)          │
+           (seller)                    │                                │
+                   │         ┌─────────┴─────────┐                      │
+                   │      toSeller            toBuyer                   │
+                   │         │                   │                      │
+                   ▼         ▼                   ▼                      │
+              RELEASED   RESOLVED            RESOLVED                   │
+            (terminal)  (terminal)           + REFUNDED ────────────────┘
 ```
+
+**State transition summary**
+
+| From | Action | To | Who |
+|---|---|---|---|
+| — | `fundDeal()` | FUNDED | Buyer |
+| FUNDED | `confirmDelivery()` | CONFIRMED | Buyer |
+| CONFIRMED | `withdrawPayment()` | RELEASED | Seller |
+| FUNDED | `refundBuyer()` | REFUNDED | Seller |
+| FUNDED | `cancelExpired()` after deadline | CANCELLED | Buyer |
+| FUNDED \| CONFIRMED | `raiseDispute()` | DISPUTED | Buyer or Seller |
+| DISPUTED | `resolveDispute(toSeller=true)` | RESOLVED | Arbitrator |
+| DISPUTED | `resolveDispute(toSeller=false)` | RESOLVED | Arbitrator |
 
 ### Security properties enforced
 
 | Threat | Mitigation |
 |---|---|
-| Reentrancy | State updated before external `.call{}()` in pull-payment functions |
-| Unauthorized withdrawal | `onlyBuyer` / `onlySeller` modifiers on all state-transition functions |
-| Admin theft | No privileged admin role; no `owner` with fund-access exists in the contract |
-| Double settlement | `buyerWithdrawn` / `sellerWithdrawn` boolean guards; state moved to terminal before transfer |
-| Zero-value escrow | `ZeroAmount` revert on `fundDeal` when `msg.value == 0` |
-| Unsafe ETH transfer | `.call{value: ...}("")` with explicit success check; `TransferFailed` error on failure |
+| Reentrancy | `_locked` mutex guards all state-changing entry points; state set to terminal **before** external `.call` (CEI) |
+| Unauthorized access | `onlyBuyer`, `onlySeller`, `onlyParty`, `onlyArbitrator` modifiers on every function |
+| Admin / arbitrator theft | Arbitrator can only route funds to the deal's own buyer or seller; no third-party path |
+| Double settlement | `fundsWithdrawn` boolean + state terminal check; state is terminal before transfer |
+| Zero-value escrow | `ZeroAmount` revert when `msg.value == 0` |
+| Self-deal | `SelfDeal` revert when `seller == msg.sender` |
+| Stale deadline | `InvalidDeadline` revert when `deadline <= block.timestamp` at creation |
+| Premature cancellation | `DeadlineNotReached` revert if buyer cancels before deadline elapses |
+| Unsafe ETH transfer | `.call{value: ...}("")` with explicit success check; `TransferFailed` on failure |
+| Plain ETH sends | `receive()` and `fallback()` both revert with descriptive message |
 
-### On-chain data minimisation
+### On-chain data stored per deal
 
-Only the following are stored on-chain:
-- `buyer` address, `seller` address, `amount` (wei), `state` enum.
-- No listing titles, offer terms, message references, or user PII.
+| Field | Type | Purpose |
+|---|---|---|
+| `buyer` | `address payable` | Fund recipient on refund/cancel |
+| `seller` | `address payable` | Fund recipient on payment release |
+| `amount` | `uint256` | Wei held in escrow |
+| `deadline` | `uint256` | Unix timestamp; buyer may cancel after this |
+| `agreementHash` | `bytes32` | `keccak256` of off-chain deal terms (integrity only) |
+| `state` | `State enum` | Current lifecycle state |
+| `fundsWithdrawn` | `bool` | Double-spend guard |
+
+No listing titles, offer text, message references, personal data, or negotiation history is stored on-chain.
 
 ---
 
-## 6. Authentication Design (Phase 2 target)
+## 6. Authentication Design (Phase 3 target)
 
 - Standard username + password registration with bcrypt hashing (via `passlib`).
 - JWT access tokens (short-lived) + HTTP-only refresh tokens (long-lived).
