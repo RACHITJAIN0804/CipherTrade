@@ -43,14 +43,14 @@ Full system boundaries and data-flow diagrams: [`docs/ARCHITECTURE.md`](docs/ARC
 
 | Feature | Status |
 |---|---|
-| Buyer & Seller authentication | 🔲 Phase 3 |
-| Listing creation & discovery | 🔲 Phase 3 |
-| End-to-end encrypted messaging | 🔲 Phase 4 |
-| Offer submission & negotiation | 🔲 Phase 4 |
-| Wallet connection (MetaMask) | 🔲 Phase 5 |
+| Buyer & Seller authentication | ✅ Phase 3 — implemented & tested |
+| Listing creation & discovery | ✅ Phase 3 — implemented & tested |
+| Offer submission & negotiation | ✅ Phase 3 — implemented & tested |
+| Reporting & blocking | ✅ Phase 3 — implemented & tested |
 | Smart-contract escrow | ✅ Phase 2 — implemented & tested |
 | On-chain dispute resolution (arbitrator) | ✅ Phase 2 — implemented & tested |
-| Reporting & blocking | 🔲 Phase 5 |
+| End-to-end encrypted messaging | 🔲 Phase 4 |
+| Wallet connection (MetaMask) | 🔲 Phase 5 |
 
 ---
 

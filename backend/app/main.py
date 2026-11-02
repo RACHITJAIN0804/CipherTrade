@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routers import health
+from app.api.v1.router import api_router
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Legacy health router (kept at /health for backwards compatibility)
     app.include_router(health.router)
+
+    # All versioned API routes
+    app.include_router(api_router)
 
     return app
