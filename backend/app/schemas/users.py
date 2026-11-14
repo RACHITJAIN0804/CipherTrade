@@ -47,6 +47,7 @@ class UserPublic(BaseModel):
     id: uuid.UUID
     display_name: str
     primary_role: UserRole
+    wallet_address: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

@@ -2,28 +2,50 @@ import axios, { AxiosError } from 'axios';
 
 const TOKEN_KEY = 'ct_token';
 
+const apiBaseUrl =
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) || 'http://localhost:8000';
+
 export const apiClient = axios.create({
-  baseURL: (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000') + '/api/v1',
+  baseURL: `${apiBaseUrl}/api/v1`,
   headers: { 'Content-Type': 'application/json' },
 });
 
 apiClient.interceptors.request.use((config) => {
-  const token = localStorage.getItem(TOKEN_KEY);
-  if (token) config.headers.Authorization = `Bearer ${token}`;
+  if (typeof localStorage !== 'undefined') {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) config.headers.Authorization = `Bearer ${token}`;
+  }
   return config;
 });
 
 apiClient.interceptors.response.use(
   (res) => res,
   (err: AxiosError) => {
-    if (err.response?.status === 401) {
+    if (err.response?.status === 401 && typeof localStorage !== 'undefined') {
       localStorage.removeItem(TOKEN_KEY);
-      window.location.href = '/login';
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.href = '/login';
+      }
     }
     return Promise.reject(err);
   }
 );
 
-export function setToken(token: string) { localStorage.setItem(TOKEN_KEY, token); }
-export function clearToken() { localStorage.removeItem(TOKEN_KEY); }
-export function getToken() { return localStorage.getItem(TOKEN_KEY); }
+export function setToken(token: string) {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.setItem(TOKEN_KEY, token);
+  }
+}
+
+export function clearToken() {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem(TOKEN_KEY);
+  }
+}
+
+export function getToken(): string | null {
+  if (typeof localStorage !== 'undefined') {
+    return localStorage.getItem(TOKEN_KEY);
+  }
+  return null;
+}

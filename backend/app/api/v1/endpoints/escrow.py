@@ -53,12 +53,37 @@ async def create_deal(
             detail="Only the buyer of this requirement can initiate escrow.",
         )
 
+    # Idempotency check: if an escrow deal already exists for this offer, return it
+    stmt = select(EscrowDeal).where(EscrowDeal.offer_id == data.offer_id)
+    existing_deal = (await db.execute(stmt)).scalar_one_or_none()
+    if existing_deal is not None:
+        return EscrowDealRead.model_validate(existing_deal)
+
     deal = await escrow_service.create_escrow_deal_record(
         db,
         buyer_id=current_user.id,
         seller_id=offer.seller_id,
         data=data,
     )
+    return EscrowDealRead.model_validate(deal)
+
+
+@router.get(
+    "/deals/by-offer/{offer_id}",
+    response_model=EscrowDealRead,
+    summary="Get escrow deal record by offer ID",
+)
+async def get_deal_by_offer(
+    offer_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> EscrowDealRead:
+    stmt = select(EscrowDeal).where(EscrowDeal.offer_id == offer_id)
+    deal = (await db.execute(stmt)).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Escrow deal not found for this offer.")
+    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     return EscrowDealRead.model_validate(deal)
 
 

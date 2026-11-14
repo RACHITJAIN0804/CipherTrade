@@ -16,6 +16,7 @@ export interface UserPublic {
   id: string;
   display_name: string;
   primary_role: UserRole;
+  wallet_address?: string | null;
   created_at: string;
 }
 export interface TokenResponse { access_token: string; token_type: string; }
