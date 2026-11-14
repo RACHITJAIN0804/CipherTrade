@@ -1,4 +1,4 @@
-"""Escrow deal endpoints (blockchain integration stub)."""
+"""Escrow deal endpoints and on-chain funding verification."""
 from __future__ import annotations
 
 import uuid
@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.models import EscrowDeal, OfferStatus, User
-from app.schemas.escrow import EscrowDealCreate, EscrowDealRead
+from app.schemas.escrow import EscrowDealCreate, EscrowDealRead, VerifyFundingRequest
 from app.services.auth_deps import get_current_user
 from app.services import escrow_service, offer_service
 
@@ -62,6 +62,49 @@ async def create_deal(
     return EscrowDealRead.model_validate(deal)
 
 
+@router.post(
+    "/deals/{deal_id}/verify-funding",
+    response_model=EscrowDealRead,
+    summary="Verify on-chain funding transaction for an escrow deal",
+)
+async def verify_funding(
+    deal_id: uuid.UUID,
+    data: VerifyFundingRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> EscrowDealRead:
+    """
+    Independently verify an on-chain fundDeal transaction receipt and event logs.
+    Only the buyer can verify funding for their deal.
+    """
+    result = await db.execute(select(EscrowDeal).where(EscrowDeal.id == deal_id))
+    deal = result.scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
+
+    if deal.buyer_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the buyer can verify funding for this deal.",
+        )
+
+    try:
+        updated_deal = await escrow_service.verify_funding_transaction(
+            db=db,
+            deal=deal,
+            tx_hash=data.tx_hash,
+            buyer=current_user,
+        )
+    except escrow_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return EscrowDealRead.model_validate(updated_deal)
+
+
 @router.get("/{deal_id}", response_model=EscrowDealRead, summary="Get escrow deal details")
 async def get_deal(
     deal_id: uuid.UUID,
@@ -75,4 +118,3 @@ async def get_deal(
     if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     return EscrowDealRead.model_validate(deal)
-

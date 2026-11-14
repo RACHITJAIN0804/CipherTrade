@@ -30,10 +30,15 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[str] = ["http://localhost:5173"]
 
-    # Blockchain (prepared for future Web3.py integration)
-    escrow_contract_address: str = ""
+    # Blockchain (Phase 5)
+    escrow_contract_address: str = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
     escrow_contract_abi_path: str = "contracts/out/CipherTradeEscrow.sol/CipherTradeEscrow.json"
     web3_rpc_url: str = "http://127.0.0.1:8545"
+    chain_id: int = 31337
+
+    @property
+    def escrow_abi_path(self) -> str:
+        return self.escrow_contract_abi_path
 
 
 @lru_cache(maxsize=1)

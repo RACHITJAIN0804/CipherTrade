@@ -17,6 +17,16 @@ class EscrowDealCreate(BaseModel):
     agreement_hash: Optional[str] = Field(None, max_length=66)
 
 
+class VerifyFundingRequest(BaseModel):
+    tx_hash: str = Field(
+        ...,
+        min_length=66,
+        max_length=66,
+        pattern=r"^0x[0-9a-fA-F]{64}$",
+        description="Ethereum transaction hash of the fundDeal() invocation (0x + 64 hex characters)",
+    )
+
+
 class EscrowDealRead(BaseModel):
     id: uuid.UUID
     offer_id: uuid.UUID
