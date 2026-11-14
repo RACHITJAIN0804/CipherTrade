@@ -2,6 +2,7 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { LayoutDashboard, FileText, ArrowLeftRight, MessageSquare, ShoppingBag, LogOut, Menu, X } from 'lucide-react';
 import { useState } from 'react';
 import { Logo } from '../components/Logo';
+import { WalletButton } from '../components/wallet';
 import { useAuth } from '../context/AuthContext';
 
 const navItems = [
@@ -67,9 +68,28 @@ export function SellerLayout() {
         </div>
       )}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <header className="md:hidden h-14 flex items-center px-4 border-b" style={{ background: '#0a1628', borderColor: 'rgba(59,130,246,0.15)' }}>
-          <button onClick={() => setSidebarOpen(true)} className="text-slate-400 hover:text-white mr-3"><Menu className="w-5 h-5" /></button>
-          <Logo size="sm" />
+        <header
+          className="h-14 flex items-center justify-between px-6 border-b flex-shrink-0"
+          style={{ background: '#0a1628', borderColor: 'rgba(59,130,246,0.15)' }}
+        >
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden text-slate-400 hover:text-white"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <div className="md:hidden">
+              <Logo size="sm" />
+            </div>
+            <div className="hidden md:flex items-center gap-2 text-xs font-medium text-slate-400">
+              <span className="w-2 h-2 rounded-full bg-cyan-500" />
+              <span>Seller Workspace</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <WalletButton />
+          </div>
         </header>
         <main className="flex-1 overflow-y-auto p-6" style={{ background: '#050c1a' }}>
           <Outlet />

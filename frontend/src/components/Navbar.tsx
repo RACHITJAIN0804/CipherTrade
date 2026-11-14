@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Logo } from './Logo';
 import { Button } from './ui';
+import { WalletButton } from './wallet';
 
 export function Navbar() {
   return (
@@ -8,6 +9,7 @@ export function Navbar() {
       <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
         <Link to="/"><Logo /></Link>
         <div className="flex items-center gap-3">
+          <WalletButton />
           <Link to="/login"><Button variant="ghost" size="sm">Sign in</Button></Link>
           <Link to="/register"><Button size="sm">Get started</Button></Link>
         </div>
