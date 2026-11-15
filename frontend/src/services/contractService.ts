@@ -318,6 +318,118 @@ export function formatContractError(err: unknown): string {
   if (rawMsg.includes('Unauthorized')) {
     return 'You are not authorized to perform this operation.';
   }
+  if (rawMsg.includes('DeadlineNotReached')) {
+    return 'The delivery deadline has not elapsed yet. Cancellation is not allowed before the deadline.';
+  }
+  if (rawMsg.includes('AlreadyWithdrawn')) {
+    return 'Funds for this escrow deal have already been withdrawn or settled.';
+  }
+  if (rawMsg.includes('InvalidState')) {
+    return 'The escrow deal is not in an eligible state for this action.';
+  }
+  if (rawMsg.includes('TransferFailed')) {
+    return 'ETH transfer failed on-chain.';
+  }
 
   return rawMsg || 'Failed to complete transaction on the blockchain.';
+}
+
+/**
+ * Buyer confirms delivery on-chain.
+ * Solidity: confirmDelivery(uint256 dealId) [onlyBuyer, FUNDED]
+ */
+export async function confirmDeliveryOnChain(
+  chainDealId: number,
+  signer: JsonRpcSigner,
+  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const contract = getEscrowContract(signer, contractAddress);
+  const tx = await contract.confirmDelivery(BigInt(chainDealId));
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('confirmDelivery transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
+}
+
+/**
+ * Buyer cancels expired deal and reclaims escrowed funds.
+ * Solidity: cancelExpired(uint256 dealId) [onlyBuyer, FUNDED, timestamp > deadline]
+ */
+export async function cancelExpiredOnChain(
+  chainDealId: number,
+  signer: JsonRpcSigner,
+  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const contract = getEscrowContract(signer, contractAddress);
+  const tx = await contract.cancelExpired(BigInt(chainDealId));
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('cancelExpired transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
+}
+
+/**
+ * Seller withdraws payment after buyer has confirmed delivery (pull payment pattern).
+ * Solidity: withdrawPayment(uint256 dealId) [onlySeller, CONFIRMED]
+ */
+export async function withdrawPaymentOnChain(
+  chainDealId: number,
+  signer: JsonRpcSigner,
+  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const contract = getEscrowContract(signer, contractAddress);
+  const tx = await contract.withdrawPayment(BigInt(chainDealId));
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('withdrawPayment transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
+}
+
+/**
+ * Seller voluntarily refunds the buyer before delivery is confirmed.
+ * Solidity: refundBuyer(uint256 dealId) [onlySeller, FUNDED]
+ */
+export async function refundBuyerOnChain(
+  chainDealId: number,
+  signer: JsonRpcSigner,
+  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const contract = getEscrowContract(signer, contractAddress);
+  const tx = await contract.refundBuyer(BigInt(chainDealId));
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('refundBuyer transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
+}
+
+/**
+ * Either party (buyer or seller) raises a dispute, freezing funds for arbitrator.
+ * Solidity: raiseDispute(uint256 dealId) [onlyParty, FUNDED or CONFIRMED]
+ */
+export async function raiseDisputeOnChain(
+  chainDealId: number,
+  signer: JsonRpcSigner,
+  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const contract = getEscrowContract(signer, contractAddress);
+  const tx = await contract.raiseDispute(BigInt(chainDealId));
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('raiseDispute transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
 }

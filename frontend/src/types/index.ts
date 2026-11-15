@@ -83,5 +83,22 @@ export interface EscrowDeal {
   updated_at: string;
 }
 
+export interface EscrowTransaction extends EscrowDeal {
+  requirement_title?: string | null;
+  requirement_category?: string | null;
+  offer_terms?: string | null;
+  buyer_display_name?: string | null;
+  buyer_wallet_address?: string | null;
+  seller_display_name?: string | null;
+  seller_wallet_address?: string | null;
+}
+
+export interface PaginatedEscrowDeals {
+  items: EscrowTransaction[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export interface ApiError { detail: string; }
 export interface PaginationParams { page?: number; page_size?: number; q?: string; category?: string; }

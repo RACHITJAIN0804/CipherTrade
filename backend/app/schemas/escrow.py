@@ -43,3 +43,21 @@ class EscrowDealRead(BaseModel):
 
     model_config = {"from_attributes": True}
 
+
+class EscrowTransactionRead(EscrowDealRead):
+    requirement_title: Optional[str] = None
+    requirement_category: Optional[str] = None
+    offer_terms: Optional[str] = None
+    buyer_display_name: Optional[str] = None
+    buyer_wallet_address: Optional[str] = None
+    seller_display_name: Optional[str] = None
+    seller_wallet_address: Optional[str] = None
+
+
+class PaginatedEscrowDeals(BaseModel):
+    items: list[EscrowTransactionRead]
+    total: int
+    page: int
+    page_size: int
+
+

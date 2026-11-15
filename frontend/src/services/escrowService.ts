@@ -1,5 +1,5 @@
 import { apiClient } from './api.ts';
-import type { EscrowDeal } from '../types';
+import type { EscrowDeal, EscrowTransaction, PaginatedEscrowDeals, EscrowState } from '../types';
 
 export interface EscrowDealCreate {
   offer_id: string;
@@ -12,6 +12,12 @@ export interface VerifyFundingPayload {
   tx_hash: string;
 }
 
+export interface ListDealsParams {
+  page?: number;
+  page_size?: number;
+  deal_state?: EscrowState;
+}
+
 /**
  * Create or retrieve an off-chain EscrowDeal linked to an accepted Offer.
  */
@@ -21,10 +27,10 @@ export async function createEscrowDeal(data: EscrowDealCreate): Promise<EscrowDe
 }
 
 /**
- * Fetch an EscrowDeal record by its backend UUID.
+ * Fetch an EscrowDeal record with transaction context by its backend UUID.
  */
-export async function getEscrowDeal(id: string): Promise<EscrowDeal> {
-  const res = await apiClient.get<EscrowDeal>(`/escrow/${id}`);
+export async function getEscrowDeal(id: string): Promise<EscrowTransaction> {
+  const res = await apiClient.get<EscrowTransaction>(`/escrow/${id}`);
   return res.data;
 }
 
@@ -33,6 +39,30 @@ export async function getEscrowDeal(id: string): Promise<EscrowDeal> {
  */
 export async function getEscrowDealByOffer(offerId: string): Promise<EscrowDeal> {
   const res = await apiClient.get<EscrowDeal>(`/escrow/deals/by-offer/${offerId}`);
+  return res.data;
+}
+
+/**
+ * Fetch paginated escrow deals where the authenticated user is the buyer.
+ */
+export async function listBuyerDeals(params?: ListDealsParams): Promise<PaginatedEscrowDeals> {
+  const res = await apiClient.get<PaginatedEscrowDeals>('/escrow/deals/buyer', { params });
+  return res.data;
+}
+
+/**
+ * Fetch paginated escrow deals where the authenticated user is the seller.
+ */
+export async function listSellerDeals(params?: ListDealsParams): Promise<PaginatedEscrowDeals> {
+  const res = await apiClient.get<PaginatedEscrowDeals>('/escrow/deals/seller', { params });
+  return res.data;
+}
+
+/**
+ * Trigger backend on-chain state sync for a deal.
+ */
+export async function syncDealState(dealId: string): Promise<EscrowTransaction> {
+  const res = await apiClient.post<EscrowTransaction>(`/escrow/deals/${dealId}/sync`);
   return res.data;
 }
 
