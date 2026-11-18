@@ -102,3 +102,25 @@ export interface PaginatedEscrowDeals {
 
 export interface ApiError { detail: string; }
 export interface PaginationParams { page?: number; page_size?: number; q?: string; category?: string; }
+
+// SIWE (EIP-4361) Wallet Ownership Verification
+export interface WalletChallengeRequest {
+  wallet_address: string;
+}
+
+export interface WalletChallengeResponse {
+  message: string;
+  nonce: string;
+  expires_at: string;
+}
+
+export interface WalletVerifyRequest {
+  message: string;
+  signature: string;
+}
+
+export interface WalletVerifyResponse {
+  success: boolean;
+  wallet_address: string;
+  user: User;
+}

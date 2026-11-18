@@ -44,7 +44,6 @@ async def create_user(db: AsyncSession, data: UserCreate) -> User:
     await db.refresh(user)
     return user
 
-
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
     """Return User if credentials are valid, else None."""
     user = await get_user_by_email(db, email)
@@ -60,8 +59,6 @@ async def authenticate_user(db: AsyncSession, email: str, password: str) -> User
 async def update_user(db: AsyncSession, user: User, data: UserUpdate) -> User:
     if data.display_name is not None:
         user.display_name = data.display_name
-    if data.wallet_address is not None:
-        user.wallet_address = data.wallet_address
     db.add(user)
     await db.commit()
     await db.refresh(user)

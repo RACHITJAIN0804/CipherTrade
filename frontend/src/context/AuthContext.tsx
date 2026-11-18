@@ -22,8 +22,11 @@ interface AuthContextValue extends AuthState {
   login: (email: string, password: string) => Promise<void>;
   register: (data: UserCreate) => Promise<void>;
   logout: () => void;
+  refreshUser: () => Promise<User | null>;
+  setUser: (user: User | null) => void;
   isAuthenticated: boolean;
 }
+
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
@@ -74,11 +77,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_USER', payload: null });
   }, []);
 
+  const refreshUser = useCallback(async (): Promise<User | null> => {
+    try {
+      const user = await getMe();
+      dispatch({ type: 'SET_USER', payload: user });
+      return user;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const setUser = useCallback((user: User | null) => {
+    dispatch({ type: 'SET_USER', payload: user });
+  }, []);
+
   return (
-    <AuthContext.Provider value={{ ...state, login, register, logout, isAuthenticated: !!state.user }}>
+    <AuthContext.Provider
+      value={{
+        ...state,
+        login,
+        register,
+        logout,
+        refreshUser,
+        setUser,
+        isAuthenticated: !!state.user,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
+
 }
 
 // Re-exported from hooks/useAuth for colocation convenience

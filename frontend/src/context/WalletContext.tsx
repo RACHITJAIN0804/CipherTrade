@@ -7,6 +7,8 @@ import {
   ANVIL_CHAIN_NAME,
   formatAddress,
 } from '../utils/wallet';
+import { useAuth } from './AuthContext';
+import { requestWalletChallenge, verifyWalletSignature } from '../services/walletVerificationService';
 
 export {
   ANVIL_CHAIN_ID,
@@ -33,9 +35,17 @@ export interface WalletContextValue {
   switchToAnvil: () => Promise<void>;
   clearWalletError: () => void;
   formatAddress: (addr?: string | null) => string;
+
+  // Phase 5D.1: Cryptographic Wallet Ownership Verification (SIWE)
+  isWalletVerified: boolean;
+  isVerifyingWallet: boolean;
+  walletVerificationError: string | null;
+  verifyWalletOwnership: () => Promise<boolean>;
+  clearWalletVerificationError: () => void;
 }
 
 const WalletContext = createContext<WalletContextValue | null>(null);
+
 
 interface ProviderRpcError extends Error {
   code: number;
@@ -43,6 +53,8 @@ interface ProviderRpcError extends Error {
 }
 
 export function WalletProvider({ children }: { children: React.ReactNode }) {
+  const { user, setUser, refreshUser } = useAuth();
+
   const [account, setAccount] = useState<string | null>(null);
   const [chainId, setChainId] = useState<number | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -50,12 +62,27 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [provider, setProvider] = useState<BrowserProvider | null>(null);
   const [signer, setSigner] = useState<JsonRpcSigner | null>(null);
 
+  // SIWE Verification state
+  const [isVerifyingWallet, setIsVerifyingWallet] = useState(false);
+  const [walletVerificationError, setWalletVerificationError] = useState<string | null>(null);
+
   const isMetaMaskInstalled = typeof window !== 'undefined' && !!window.ethereum;
   const isConnected = !!account;
   const isCorrectNetwork = chainId === ANVIL_CHAIN_ID;
 
+  // True if connected MetaMask wallet matches the user's verified profile wallet_address
+  const isWalletVerified = Boolean(
+    account &&
+    user?.wallet_address &&
+    account.toLowerCase() === user.wallet_address.toLowerCase()
+  );
+
   const clearWalletError = useCallback(() => {
     setWalletError(null);
+  }, []);
+
+  const clearWalletVerificationError = useCallback(() => {
+    setWalletVerificationError(null);
   }, []);
 
   const disconnectWallet = useCallback(() => {
@@ -64,12 +91,15 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setProvider(null);
     setSigner(null);
     setWalletError(null);
+    setWalletVerificationError(null);
+    setIsVerifyingWallet(false);
     try {
       localStorage.removeItem(WALLET_CONNECTED_KEY);
     } catch {
       // Ignore storage errors
     }
   }, []);
+
 
   const switchToAnvil = useCallback(async () => {
     if (!window.ethereum) {
@@ -254,6 +284,68 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     };
   }, [disconnectWallet, initProviderAndSigner]);
 
+  const verifyWalletOwnership = useCallback(async (): Promise<boolean> => {
+    if (!account || !signer) {
+      setWalletVerificationError('Please connect your MetaMask wallet first.');
+      return false;
+    }
+    if (chainId !== ANVIL_CHAIN_ID) {
+      setWalletVerificationError('Please switch to the Anvil Local network before verifying.');
+      return false;
+    }
+
+    setIsVerifyingWallet(true);
+    setWalletVerificationError(null);
+
+    try {
+      // Step A: Request challenge from backend
+      const challenge = await requestWalletChallenge(account);
+
+      // Verify account hasn't changed before signing
+      const currentSignerAddress = await signer.getAddress();
+      if (currentSignerAddress.toLowerCase() !== account.toLowerCase()) {
+        throw new Error('Active MetaMask account changed. Please try again.');
+      }
+
+      // Step B: Prompt user to sign EIP-4361 SIWE challenge in MetaMask
+      const signature = await signer.signMessage(challenge.message);
+
+      // Verify active account has not switched in MetaMask during user approval prompt (Fix 3)
+      const postSignerAddress = await signer.getAddress();
+      if (postSignerAddress.toLowerCase() !== account.toLowerCase()) {
+        throw new Error('Active MetaMask account changed during signing. Please try again.');
+      }
+
+      // Step C: Submit signature to backend
+      const result = await verifyWalletSignature(challenge.message, signature);
+
+      // Step D: Update user profile in AuthContext
+      if (result.user) {
+        setUser(result.user);
+      } else {
+        await refreshUser();
+      }
+
+      return true;
+    } catch (err: unknown) {
+      const rpcErr = err as { code?: number | string; message?: string; response?: { data?: { detail?: string } } };
+      let errorMsg = 'Failed to verify wallet ownership.';
+
+      if (rpcErr.code === 4001 || rpcErr.code === 'ACTION_REJECTED') {
+        errorMsg = 'Signature request was rejected in MetaMask.';
+      } else if (rpcErr.response?.data?.detail) {
+        errorMsg = rpcErr.response.data.detail;
+      } else if (rpcErr.message) {
+        errorMsg = rpcErr.message;
+      }
+
+      setWalletVerificationError(errorMsg);
+      return false;
+    } finally {
+      setIsVerifyingWallet(false);
+    }
+  }, [account, chainId, signer, setUser, refreshUser]);
+
   return (
     <WalletContext.Provider
       value={{
@@ -271,11 +363,17 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         switchToAnvil,
         clearWalletError,
         formatAddress,
+        isWalletVerified,
+        isVerifyingWallet,
+        walletVerificationError,
+        verifyWalletOwnership,
+        clearWalletVerificationError,
       }}
     >
       {children}
     </WalletContext.Provider>
   );
+
 }
 
 export function useWallet(): WalletContextValue {

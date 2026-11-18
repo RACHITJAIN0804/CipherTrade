@@ -3,14 +3,21 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.models.models import User
 from app.schemas.users import UserPublic, UserRead, UserUpdate
+from app.schemas.wallet import (
+    WalletChallengeRequest,
+    WalletChallengeResponse,
+    WalletVerifyRequest,
+    WalletVerifyResponse,
+)
 from app.services.auth_deps import get_current_user
-from app.services import user_service
+from app.services import user_service, wallet_service
+from app.services.wallet_service import ConflictError
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -26,8 +33,83 @@ async def update_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> UserRead:
+    if data.wallet_address is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Direct wallet_address update is not permitted. "
+                "Please verify wallet ownership cryptographically via /api/v1/auth/wallet/challenge and /api/v1/auth/wallet/verify."
+            ),
+        )
     updated = await user_service.update_user(db, current_user, data)
     return UserRead.model_validate(updated)
+
+
+@router.post(
+    "/me/wallet/challenge",
+    response_model=WalletChallengeResponse,
+    summary="Request an EIP-4361 SIWE challenge to link a wallet address",
+)
+async def request_my_wallet_challenge(
+    data: WalletChallengeRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WalletChallengeResponse:
+    try:
+        raw_host = request.headers.get("host") or request.url.netloc or "localhost"
+        validated_domain = wallet_service.validate_trusted_domain(raw_host)
+        uri = str(request.base_url).rstrip("/")
+        challenge = await wallet_service.create_wallet_challenge(
+            db=db,
+            user=current_user,
+            candidate_address=data.wallet_address,
+            domain=validated_domain,
+            uri=uri,
+        )
+    except ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return challenge
+
+
+@router.post(
+    "/me/wallet/verify",
+    response_model=WalletVerifyResponse,
+    summary="Submit signed SIWE challenge to link wallet address to user account",
+)
+async def verify_my_wallet(
+    data: WalletVerifyRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WalletVerifyResponse:
+    try:
+        raw_host = request.headers.get("host") or request.url.netloc or "localhost"
+        validated_domain = wallet_service.validate_trusted_domain(raw_host)
+        updated_user = await wallet_service.verify_wallet_challenge(
+            db=db,
+            user=current_user,
+            message_text=data.message,
+            signature=data.signature,
+            expected_domain=validated_domain,
+        )
+
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return WalletVerifyResponse(
+        success=True,
+        wallet_address=str(updated_user.wallet_address),
+        user=UserRead.model_validate(updated_user),
+    )
+
+
 
 
 @router.get(

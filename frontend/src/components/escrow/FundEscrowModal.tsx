@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import {
   Coins,
   ShieldCheck,
+  ShieldAlert,
+  Shield,
   AlertTriangle,
   CheckCircle2,
   Copy,
@@ -13,9 +15,9 @@ import {
   AlertCircle,
   Database,
 } from 'lucide-react';
+
 import { isAddress, getAddress, parseEther } from 'ethers';
 import { useWallet } from '../../context/WalletContext';
-import { useAuth } from '../../context/AuthContext';
 import {
   fundEscrowDeal,
   generateAgreementHash,
@@ -26,7 +28,8 @@ import {
   createEscrowDeal,
   verifyFunding,
 } from '../../services/escrowService';
-import { getUser, updateMe } from '../../services/userService';
+import { getUser } from '../../services/userService';
+
 import { ESCROW_CONTRACT_ADDRESS, ESCROW_CHAIN_ID } from '../../config/contracts';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
@@ -79,12 +82,13 @@ export function FundEscrowModal({
     connectWallet,
     switchToAnvil,
     formatAddress,
+    isWalletVerified,
+    verifyWalletOwnership,
   } = useWallet();
-
-  const { user } = useAuth();
 
   // Form state
   const [sellerAddr, setSellerAddr] = useState('');
+
   const [registeredSellerWallet, setRegisteredSellerWallet] = useState<string | null>(null);
   const [checkingSellerWallet, setCheckingSellerWallet] = useState(false);
   const [amount, setAmount] = useState('');
@@ -261,14 +265,15 @@ export function FundEscrowModal({
       setErrorMessage(null);
       setVerificationError(null);
 
-      // Pre-flight 1: Ensure buyer's wallet is saved on their profile
-      if (!user?.wallet_address || getAddress(user.wallet_address).toLowerCase() !== getAddress(account).toLowerCase()) {
-        try {
-          await updateMe({ wallet_address: account });
-        } catch {
-          // Non-blocking if already matched
+      // Pre-flight 1: Ensure buyer's wallet is cryptographically verified via EIP-4361 SIWE
+      if (!isWalletVerified) {
+        const verified = await verifyWalletOwnership();
+        if (!verified) {
+          setErrorMessage('Cryptographic wallet ownership verification (SIWE) is required before funding escrow.');
+          return;
         }
       }
+
 
       // Pre-flight 2: Create or retrieve backend EscrowDeal record to obtain the authoritative deal UUID
       let targetDealId = activeDealId;
@@ -375,7 +380,28 @@ export function FundEscrowModal({
           </div>
         )}
 
+        {isConnected && isCorrectNetwork && !isWalletVerified && (
+          <div className="p-3.5 rounded-lg bg-blue-950/40 border border-blue-500/40 flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5 text-blue-200">
+              <ShieldAlert className="w-4 h-4 text-blue-400 shrink-0" />
+              <div>
+                <p className="font-semibold text-white">Wallet Ownership Not Verified</p>
+                <p className="text-slate-400">Sign an EIP-4361 challenge to link this wallet address to your profile.</p>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={verifyWalletOwnership}
+              leftIcon={<Shield className="w-3.5 h-3.5" />}
+            >
+              Verify Wallet
+            </Button>
+          </div>
+        )}
+
         {/* STEP: Form */}
+
         {step === 'form' && (
           <div className="space-y-4">
             {/* Contract info bar */}

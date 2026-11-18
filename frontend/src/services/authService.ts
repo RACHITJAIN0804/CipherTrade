@@ -18,3 +18,5 @@ export async function getMe(): Promise<User> {
 }
 
 export function logout() { clearToken(); }
+
+export { requestWalletChallenge, verifyWalletSignature } from './walletVerificationService';

@@ -19,9 +19,12 @@ from decimal import Decimal
 import pytest
 from httpx import AsyncClient
 from web3 import Web3
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from app.core.blockchain import get_escrow_contract, get_web3
 from app.models.models import EscrowState
+
 
 # Standard deterministic Anvil local development accounts
 ANVIL_ACCOUNTS = {
@@ -45,7 +48,7 @@ ANVIL_ACCOUNTS = {
 
 
 async def _register_user(client: AsyncClient, email: str, role: str, wallet: str) -> str:
-    """Register user, update wallet in profile, and return JWT access token."""
+    """Register user, verify wallet ownership via SIWE, and return JWT access token."""
     await client.post(
         "/api/v1/auth/register",
         json={
@@ -60,12 +63,31 @@ async def _register_user(client: AsyncClient, email: str, role: str, wallet: str
         json={"email": email, "password": "ValidPass1!"},
     )
     token = login_resp.json()["access_token"]
-    await client.patch(
-        "/api/v1/users/me",
-        json={"wallet_address": wallet},
-        headers={"Authorization": f"Bearer {token}"},
-    )
+
+    pk = None
+    for acc in ANVIL_ACCOUNTS.values():
+        if acc["address"].lower() == wallet.lower():
+            pk = acc["pk"]
+            break
+
+    if pk:
+        chal_resp = await client.post(
+            "/api/v1/auth/wallet/challenge",
+            json={"wallet_address": wallet},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert chal_resp.status_code == 200, chal_resp.text
+        msg = chal_resp.json()["message"]
+        sig = Account.from_key(pk).sign_message(encode_defunct(text=msg)).signature.hex()
+        ver_resp = await client.post(
+            "/api/v1/auth/wallet/verify",
+            json={"message": msg, "signature": sig},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ver_resp.status_code == 200, ver_resp.text
+
     return token
+
 
 
 def _send_on_chain_tx(w3: Web3, sender_addr: str, sender_pk: str, contract_call, value_wei: int = 0) -> str:

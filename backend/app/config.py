@@ -36,6 +36,20 @@ class Settings(BaseSettings):
     web3_rpc_url: str = "http://127.0.0.1:8545"
     chain_id: int = 31337
 
+    # SIWE (EIP-4361)
+    siwe_domain: str = "localhost"
+    siwe_uri: str = "http://localhost:5173"
+    siwe_expire_minutes: int = 5
+    siwe_trusted_domains: list[str] = ["localhost", "127.0.0.1", "testserver", "test"]
+    siwe_trusted_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://testserver",
+        "http://test",
+    ]
+
     @property
     def escrow_abi_path(self) -> str:
         return self.escrow_contract_abi_path

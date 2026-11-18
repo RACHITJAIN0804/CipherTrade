@@ -41,13 +41,27 @@ async def test_update_profile(client: AsyncClient):
 
     resp = await client.patch(
         "/api/v1/users/me",
-        json={"display_name": "New Name", "wallet_address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"},
+        json={"display_name": "New Name"},
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["display_name"] == "New Name"
-    assert body["wallet_address"] == "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+
+
+@pytest.mark.asyncio
+async def test_update_profile_direct_wallet_rejected(client: AsyncClient):
+    """Direct modification of wallet_address via PATCH /users/me must be rejected."""
+    token = await _register_and_login(client, "reject_wallet@test.com", "User", "buyer")
+
+    resp = await client.patch(
+        "/api/v1/users/me",
+        json={"wallet_address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert "Direct wallet_address update is not permitted" in resp.json()["detail"]
+
 
 
 @pytest.mark.asyncio

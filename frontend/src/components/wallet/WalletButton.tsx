@@ -10,8 +10,12 @@ import {
   ExternalLink,
   X,
   Radio,
+  Shield,
+  ShieldCheck,
+  ShieldAlert,
 } from 'lucide-react';
 import { useWallet } from '../../context/WalletContext';
+import { useAuth } from '../../context/AuthContext';
 
 interface WalletButtonProps {
   className?: string;
@@ -19,6 +23,7 @@ interface WalletButtonProps {
 }
 
 export function WalletButton({ className = '', showNetworkBadge = true }: WalletButtonProps) {
+  const { user } = useAuth();
   const {
     account,
     chainId,
@@ -32,12 +37,18 @@ export function WalletButton({ className = '', showNetworkBadge = true }: Wallet
     switchToAnvil,
     clearWalletError,
     formatAddress,
+    isWalletVerified,
+    isVerifyingWallet,
+    walletVerificationError,
+    verifyWalletOwnership,
+    clearWalletVerificationError,
   } = useWallet();
 
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [switchingNetwork, setSwitchingNetwork] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -162,14 +173,27 @@ export function WalletButton({ className = '', showNetworkBadge = true }: Wallet
         onClick={() => setDropdownOpen((prev) => !prev)}
         className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-mono font-medium text-slate-200 bg-slate-900/80 border border-slate-700/60 hover:bg-slate-800/80 hover:border-blue-500/40 transition-all shadow-sm"
       >
-        <span className="w-2 h-2 rounded-full bg-blue-400" />
+        {isWalletVerified ? (
+          <span title="Verified Account Wallet">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+          </span>
+        ) : (
+          <span className="w-2 h-2 rounded-full bg-blue-400" />
+        )}
+
         <span>{formatAddress(account)}</span>
+        {isWalletVerified && (
+          <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-1 py-0.5 rounded border border-emerald-500/20 font-sans font-medium">
+            Verified
+          </span>
+        )}
         <ChevronDown
           className={`w-3.5 h-3.5 text-slate-400 transition-transform duration-200 ${
             dropdownOpen ? 'rotate-180' : ''
           }`}
         />
       </button>
+
 
       {/* Dropdown Card */}
       {dropdownOpen && (
@@ -256,7 +280,72 @@ export function WalletButton({ className = '', showNetworkBadge = true }: Wallet
             )}
           </div>
 
+          {/* SIWE Wallet Verification Status Box */}
+          {user && (
+            <div className="mb-4 p-2.5 rounded-lg bg-slate-950/70 border border-slate-800/80">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[10px] uppercase tracking-wider text-slate-500">
+                  Account Ownership
+                </span>
+                <span className="text-[10px] font-mono text-slate-400">
+                  EIP-4361 SIWE
+                </span>
+              </div>
+
+              {isWalletVerified ? (
+                <div className="flex items-center gap-2 text-xs text-emerald-300 bg-emerald-950/30 p-2 rounded-lg border border-emerald-500/20">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="font-semibold text-emerald-200">Verified Account Wallet</p>
+                    <p className="text-[10px] text-emerald-400/80 truncate">Cryptographically proven ownership</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-1.5 text-xs text-amber-300">
+                    <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span className="font-medium">Wallet Not Verified</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Prove ownership of this address to link it to your account profile.
+                  </p>
+                  <button
+                    onClick={async () => {
+                      await verifyWalletOwnership();
+                    }}
+                    disabled={isVerifyingWallet || !isCorrectNetwork}
+                    className="w-full py-1.5 px-3 rounded-lg text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 transition-all flex items-center justify-center gap-1.5 shadow-sm shadow-blue-500/20"
+                  >
+                    {isVerifyingWallet ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Sign SIWE in MetaMask...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Shield className="w-3.5 h-3.5" />
+                        <span>Verify Wallet Ownership</span>
+                      </>
+                    )}
+                  </button>
+                  {walletVerificationError && (
+                    <div className="text-[11px] text-red-300 bg-red-950/70 p-2 rounded border border-red-500/30 flex items-start justify-between gap-1">
+                      <span className="flex-1">{walletVerificationError}</span>
+                      <button
+                        onClick={clearWalletVerificationError}
+                        className="text-red-400 hover:text-white p-0.5 rounded"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Disconnect Action */}
+
           <button
             onClick={() => {
               disconnectWallet();
