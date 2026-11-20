@@ -16,6 +16,7 @@ from app.core.blockchain import get_escrow_contract, get_web3
 from app.core.database import get_db
 from app.models.models import EscrowDeal, EscrowState, Offer, OfferStatus, User
 from app.schemas.escrow import (
+    CanonicalAgreementResponse,
     EscrowDealCreate,
     EscrowDealRead,
     EscrowTransactionRead,
@@ -23,7 +24,7 @@ from app.schemas.escrow import (
     VerifyFundingRequest,
 )
 from app.services.auth_deps import get_current_user
-from app.services import escrow_service, offer_service
+from app.services import agreement_service, escrow_service, offer_service
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +72,24 @@ async def create_deal(
     stmt = select(EscrowDeal).where(EscrowDeal.offer_id == data.offer_id)
     existing_deal = (await db.execute(stmt)).scalar_one_or_none()
     if existing_deal is not None:
+        if not existing_deal.agreement_hash:
+            _, ag_hash = agreement_service.generate_canonical_hash_for_entities(offer, req)
+            existing_deal.agreement_hash = ag_hash
+            await db.commit()
+            await db.refresh(existing_deal)
         return EscrowDealRead.model_validate(existing_deal)
 
-    deal = await escrow_service.create_escrow_deal_record(
-        db,
-        buyer_id=current_user.id,
-        seller_id=offer.seller_id,
-        data=data,
-    )
+    try:
+        deal = await escrow_service.create_escrow_deal_record(
+            db,
+            buyer_id=current_user.id,
+            seller_id=offer.seller_id,
+            data=data,
+            offer=offer,
+            requirement=req,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return EscrowDealRead.model_validate(deal)
 
 
@@ -411,3 +422,73 @@ async def get_deal(
     if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     return format_escrow_transaction(deal)
+
+
+@router.get(
+    "/deals/{deal_id}/agreement",
+    response_model=CanonicalAgreementResponse,
+    summary="Get authoritative canonical agreement and hash for an escrow deal",
+)
+async def get_deal_agreement(
+    deal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CanonicalAgreementResponse:
+    deal = (await db.execute(select(EscrowDeal).where(EscrowDeal.id == deal_id))).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
+    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        canonical_dict, ag_hash = await agreement_service.get_canonical_agreement_for_offer(db, deal.offer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return CanonicalAgreementResponse(
+        deal_id=deal.id,
+        offer_id=deal.offer_id,
+        agreement_hash=ag_hash,
+        canonical_agreement=canonical_dict,
+        schema_version=agreement_service.CANONICAL_AGREEMENT_SCHEMA_VERSION,
+    )
+
+
+@router.get(
+    "/offers/{offer_id}/agreement",
+    response_model=CanonicalAgreementResponse,
+    summary="Get authoritative canonical agreement and hash for an accepted offer",
+)
+async def get_offer_agreement(
+    offer_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CanonicalAgreementResponse:
+    stmt = (
+        select(Offer)
+        .where(Offer.id == offer_id)
+        .options(selectinload(Offer.requirement))
+    )
+    offer = (await db.execute(stmt)).scalar_one_or_none()
+    if offer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found.")
+    if offer.requirement is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requirement not found.")
+    if offer.requirement.buyer_id != current_user.id and offer.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        canonical_dict, ag_hash = await agreement_service.get_canonical_agreement_for_offer(db, offer.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    deal_stmt = select(EscrowDeal).where(EscrowDeal.offer_id == offer.id)
+    deal = (await db.execute(deal_stmt)).scalar_one_or_none()
+
+    return CanonicalAgreementResponse(
+        deal_id=deal.id if deal else None,
+        offer_id=offer.id,
+        agreement_hash=ag_hash,
+        canonical_agreement=canonical_dict,
+        schema_version=agreement_service.CANONICAL_AGREEMENT_SCHEMA_VERSION,
+    )

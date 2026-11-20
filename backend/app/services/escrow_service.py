@@ -37,8 +37,9 @@ from app.core.blockchain import (
     get_web3,
     load_contract_abi,
 )
-from app.models.models import EscrowDeal, EscrowState, User
+from app.models.models import EscrowDeal, EscrowState, Offer, Requirement, User
 from app.schemas.escrow import EscrowDealCreate
+from app.services import agreement_service
 
 logger = logging.getLogger(__name__)
 
@@ -60,20 +61,65 @@ async def create_escrow_deal_record(
     buyer_id: uuid.UUID,
     seller_id: uuid.UUID,
     data: EscrowDealCreate,
+    offer: Optional[Offer] = None,
+    requirement: Optional[Requirement] = None,
 ) -> EscrowDeal:
     """
     Create the off-chain EscrowDeal row linked to an accepted Offer.
-
-    The on_chain_state is left NULL until verify_funding_transaction() confirms
-    the transaction on-chain.
+    The agreement hash, amount, and deadline are derived authoritatively from the
+    database Offer and Requirement records, rejecting any client-supplied tampering (Phase 5D.2).
     """
+    from sqlalchemy.orm import selectinload
+
+    if offer is None:
+        stmt_offer = (
+            select(Offer)
+            .where(Offer.id == data.offer_id)
+            .options(selectinload(Offer.requirement))
+        )
+        offer = (await db.execute(stmt_offer)).scalar_one_or_none()
+        if offer is None:
+            raise ValueError("Offer not found.")
+        requirement = offer.requirement
+
+    if requirement is None:
+        stmt_req = select(Requirement).where(Requirement.id == offer.requirement_id)
+        requirement = (await db.execute(stmt_req)).scalar_one_or_none()
+        if requirement is None:
+            raise ValueError("Requirement not found.")
+
+    # 1. Authoritative canonical agreement hash computation (Phase 5D.2)
+    _, authoritative_hash = agreement_service.generate_canonical_hash_for_entities(
+        offer, requirement
+    )
+
+    # 2. Derive authoritative amounts and deadlines from accepted offer
+    authoritative_amount = float(offer.price_eth)
+    authoritative_deadline = int(offer.delivery_deadline)
+
+    # 3. Explicitly reject unauthorized overrides of authoritative fields (Phase 5D.2)
+    if data.agreement_hash is not None and data.agreement_hash.lower() != authoritative_hash.lower():
+        raise ValueError(
+            "Unauthorized override attempt: client-supplied agreement_hash does not match backend canonical agreement hash."
+        )
+
+    if data.amount_eth is not None and abs(data.amount_eth - authoritative_amount) > 1e-8:
+        raise ValueError(
+            f"Unauthorized override attempt: client-supplied amount_eth ({data.amount_eth}) does not match accepted offer price ({authoritative_amount})."
+        )
+
+    if data.deadline_ts is not None and data.deadline_ts != authoritative_deadline:
+        raise ValueError(
+            f"Unauthorized override attempt: client-supplied deadline_ts ({data.deadline_ts}) does not match accepted offer deadline ({authoritative_deadline})."
+        )
+
     deal = EscrowDeal(
         offer_id=data.offer_id,
         buyer_id=buyer_id,
         seller_id=seller_id,
-        amount_eth=data.amount_eth,
-        deadline_ts=data.deadline_ts,
-        agreement_hash=data.agreement_hash,
+        amount_eth=authoritative_amount,
+        deadline_ts=authoritative_deadline,
+        agreement_hash=authoritative_hash,
         on_chain_state=None,
     )
     db.add(deal)
@@ -257,16 +303,34 @@ async def verify_funding_transaction(
     # 17. Verify agreement hash strictly against expected deal agreement_hash
     raw_event_hash = event_args["agreementHash"]
     event_hash_hex = ("0x" + raw_event_hash.hex()) if isinstance(raw_event_hash, (bytes, bytearray)) else str(raw_event_hash)
-    if not deal.agreement_hash:
+
+    # Re-calculate authoritative canonical agreement hash from database records (Phase 5D.2)
+    from sqlalchemy.orm import selectinload
+    stmt_offer = (
+        select(Offer)
+        .where(Offer.id == deal.offer_id)
+        .options(selectinload(Offer.requirement))
+    )
+    offer = (await db.execute(stmt_offer)).scalar_one_or_none()
+    if offer and offer.requirement:
+        _, canonical_hash = agreement_service.generate_canonical_hash_for_entities(
+            offer, offer.requirement
+        )
+        expected_hash = canonical_hash.lower()
+        if deal.agreement_hash and deal.agreement_hash.lower() != expected_hash:
+            raise ValueError("Deal record agreement hash does not match authoritative canonical agreement hash.")
+    elif deal.agreement_hash:
+        expected_hash = deal.agreement_hash.lower()
+    else:
         raise ValueError(
             "Deal does not have an expected agreement hash recorded in the database. "
             "Verification cannot proceed without an authoritative expected agreement hash."
         )
-    expected_hash = deal.agreement_hash.lower()
+
     if not expected_hash.startswith("0x"):
         expected_hash = "0x" + expected_hash
     if event_hash_hex.lower() != expected_hash:
-        raise ValueError(f"Agreement hash mismatch. Expected {deal.agreement_hash}, got {event_hash_hex}.")
+        raise ValueError(f"Agreement hash mismatch. Expected {expected_hash}, got {event_hash_hex}.")
 
     # 18. Cross-check stored deal on the smart contract getter getDeal(dealId)
     try:

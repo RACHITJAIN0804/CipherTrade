@@ -3,9 +3,17 @@ import type { EscrowDeal, EscrowTransaction, PaginatedEscrowDeals, EscrowState }
 
 export interface EscrowDealCreate {
   offer_id: string;
-  amount_eth: number;
-  deadline_ts: number;
+  amount_eth?: number;
+  deadline_ts?: number;
   agreement_hash?: string;
+}
+
+export interface CanonicalAgreementResponse {
+  deal_id?: string | null;
+  offer_id: string;
+  agreement_hash: string;
+  canonical_agreement: Record<string, unknown>;
+  schema_version: string;
 }
 
 export interface VerifyFundingPayload {
@@ -81,5 +89,21 @@ export async function verifyFunding(dealId: string, txHash: string): Promise<Esc
  */
 export async function getContractInfo(): Promise<{ address: string; abi: unknown }> {
   const res = await apiClient.get('/escrow/contract-info');
+  return res.data;
+}
+
+/**
+ * Fetch authoritative canonical agreement and hash for an escrow deal.
+ */
+export async function getCanonicalAgreement(dealId: string): Promise<CanonicalAgreementResponse> {
+  const res = await apiClient.get<CanonicalAgreementResponse>(`/escrow/deals/${dealId}/agreement`);
+  return res.data;
+}
+
+/**
+ * Fetch authoritative canonical agreement and hash for an accepted offer.
+ */
+export async function getCanonicalAgreementByOffer(offerId: string): Promise<CanonicalAgreementResponse> {
+  const res = await apiClient.get<CanonicalAgreementResponse>(`/escrow/offers/${offerId}/agreement`);
   return res.data;
 }

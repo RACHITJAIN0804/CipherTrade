@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -12,9 +12,17 @@ from app.models.models import EscrowState
 
 class EscrowDealCreate(BaseModel):
     offer_id: uuid.UUID
-    amount_eth: float = Field(..., gt=0)
-    deadline_ts: int = Field(..., gt=0, description="Unix timestamp passed to fundDeal()")
+    amount_eth: Optional[float] = Field(None, gt=0)
+    deadline_ts: Optional[int] = Field(None, gt=0, description="Unix timestamp passed to fundDeal()")
     agreement_hash: Optional[str] = Field(None, max_length=66)
+
+
+class CanonicalAgreementResponse(BaseModel):
+    deal_id: Optional[uuid.UUID] = None
+    offer_id: uuid.UUID
+    agreement_hash: str = Field(..., pattern=r"^0x[0-9a-fA-F]{64}$")
+    canonical_agreement: dict[str, Any]
+    schema_version: str
 
 
 class VerifyFundingRequest(BaseModel):

@@ -65,9 +65,6 @@ async def test_create_and_get_escrow_deal(client: AsyncClient):
     # 5. Buyer creates escrow deal record
     deal_resp = await client.post("/api/v1/escrow/deals", json={
         "offer_id": offer_id,
-        "amount_eth": 1.5,
-        "deadline_ts": deadline,
-        "agreement_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     }, headers={"Authorization": f"Bearer {buyer_token}"})
     assert deal_resp.status_code == 201
     deal = deal_resp.json()

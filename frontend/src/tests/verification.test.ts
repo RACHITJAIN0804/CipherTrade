@@ -6,6 +6,8 @@ import {
   createEscrowDeal,
   getEscrowDeal,
   getEscrowDealByOffer,
+  getCanonicalAgreement,
+  getCanonicalAgreementByOffer,
   verifyFunding,
 } from '../services/escrowService.ts';
 import { apiClient } from '../services/api.ts';
@@ -260,9 +262,6 @@ describe('Phase 5C.3: Escrow Backend Verification API Client & Mock Lifecycle', 
       assert.equal(url, '/escrow/deals');
       assert.deepEqual(payload, {
         offer_id: mockDeal.offer_id,
-        amount_eth: 1.5,
-        deadline_ts: 1800000000,
-        agreement_hash: mockDeal.agreement_hash,
       });
       return { data: mockDeal };
     }) as any;
@@ -270,14 +269,109 @@ describe('Phase 5C.3: Escrow Backend Verification API Client & Mock Lifecycle', 
     try {
       const created = await createEscrowDeal({
         offer_id: mockDeal.offer_id,
-        amount_eth: 1.5,
-        deadline_ts: 1800000000,
-        agreement_hash: mockDeal.agreement_hash!,
       });
       assert.equal(created.id, mockDeal.id);
     } finally {
       apiClient.post = originalPost;
     }
+  });
+
+  it('should fetch canonical agreement by deal UUID via getCanonicalAgreement', async () => {
+    const mockCanonical = {
+      deal_id: mockDeal.id,
+      offer_id: mockDeal.offer_id,
+      agreement_hash: '0xa11a6f30827ca95ab877aaa0be6b5491848b4b119f295da16ff455aecabbbc15',
+      canonical_agreement: {
+        schema_version: 'ciphertrade-agreement-v1',
+        offer_id: mockDeal.offer_id,
+        price_eth: '1.50000000',
+        currency: 'ETH',
+      },
+      schema_version: 'ciphertrade-agreement-v1',
+    };
+
+    apiClient.get = (async (url: string) => {
+      assert.equal(url, `/escrow/deals/${mockDeal.id}/agreement`);
+      return { data: mockCanonical };
+    }) as any;
+
+    try {
+      const res = await getCanonicalAgreement(mockDeal.id);
+      assert.equal(res.deal_id, mockDeal.id);
+      assert.equal(res.agreement_hash, mockCanonical.agreement_hash);
+      assert.equal(res.schema_version, 'ciphertrade-agreement-v1');
+    } finally {
+      apiClient.get = originalGet;
+    }
+  });
+
+  it('should fetch canonical agreement by offer UUID via getCanonicalAgreementByOffer', async () => {
+    const mockCanonical = {
+      deal_id: null,
+      offer_id: mockDeal.offer_id,
+      agreement_hash: '0xa11a6f30827ca95ab877aaa0be6b5491848b4b119f295da16ff455aecabbbc15',
+      canonical_agreement: {
+        schema_version: 'ciphertrade-agreement-v1',
+        offer_id: mockDeal.offer_id,
+        price_eth: '1.50000000',
+        currency: 'ETH',
+      },
+      schema_version: 'ciphertrade-agreement-v1',
+    };
+
+    apiClient.get = (async (url: string) => {
+      assert.equal(url, `/escrow/offers/${mockDeal.offer_id}/agreement`);
+      return { data: mockCanonical };
+    }) as any;
+
+    try {
+      const res = await getCanonicalAgreementByOffer(mockDeal.offer_id);
+      assert.equal(res.offer_id, mockDeal.offer_id);
+      assert.equal(res.agreement_hash, mockCanonical.agreement_hash);
+      assert.equal(res.deal_id, null);
+    } finally {
+      apiClient.get = originalGet;
+    }
+  });
+});
+
+describe('Phase 5D.2: Cross-Platform Canonical Agreement Hash Verification', () => {
+  it('should reproduce deterministic Keccak-256 agreement hash matching Python backend serialization', () => {
+    // Fixed canonical agreement test vector matching backend Python test
+    const canonicalAgreement = {
+      buyer_id: '00000000-0000-0000-0000-000000000001',
+      category: 'Data Extraction',
+      currency: 'ETH',
+      deal_reference: 'offer:00000000-0000-0000-0000-000000000002',
+      delivery_deadline: '2026-12-01T12:00:00Z',
+      description: 'Test requirement description for fixed vector audit.',
+      offer_id: '00000000-0000-0000-0000-000000000002',
+      price_eth: '1.50000000',
+      requirement_id: '00000000-0000-0000-0000-000000000003',
+      schema_version: 'ciphertrade-agreement-v1',
+      seller_id: '00000000-0000-0000-0000-000000000004',
+      terms: 'Standard test terms for fixed vector verification.',
+      title: 'Test Requirement Title',
+    };
+
+    // Deterministic sorted JSON stringify
+    const sortedKeys = Object.keys(canonicalAgreement).sort();
+    const sortedObj: Record<string, unknown> = {};
+    for (const key of sortedKeys) {
+      sortedObj[key] = (canonicalAgreement as any)[key];
+    }
+    const jsonStr = JSON.stringify(sortedObj);
+
+    // Keccak-256 using ethers
+    const hash = keccak256(toUtf8Bytes(jsonStr)).toLowerCase();
+
+    // Fixed expected 32-byte Keccak-256 hash constant shared with Python Web3 test
+    const expectedFixedHash = '0x6ef525c2e13920dbdb3549d949f23ddf711192863dee0cbae7df2b468a7adea2';
+
+    assert.equal(hash, expectedFixedHash, `Hash mismatch! Got ${hash}, expected ${expectedFixedHash}`);
+    assert.ok(hash.startsWith('0x'));
+    assert.equal(hash.length, 66);
+    assert.ok(/^0x[0-9a-f]{64}$/.test(hash));
   });
 });
 

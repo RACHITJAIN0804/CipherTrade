@@ -9,7 +9,7 @@ from typing import Optional
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Requirement, RequirementStatus, User, UserRole
+from app.models.models import Offer, OfferStatus, Requirement, RequirementStatus, User, UserRole
 from app.schemas.requirements import RequirementCreate, RequirementUpdate
 
 
@@ -94,6 +94,16 @@ async def update_requirement(
 ) -> Requirement:
     if req.buyer_id != requester_id:
         raise PermissionError("Not the owner of this requirement.")
+
+    # Guard: prevent modifying requirement terms if an offer has already been accepted (Phase 5D.2)
+    stmt_accepted = select(Offer).where(
+        Offer.requirement_id == req.id,
+        Offer.status == OfferStatus.ACCEPTED,
+    )
+    accepted_offer = (await db.execute(stmt_accepted)).scalar_one_or_none()
+    if accepted_offer is not None:
+        raise ValueError("Cannot modify requirement terms after an offer has been accepted.")
+
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(req, field, value)
     db.add(req)

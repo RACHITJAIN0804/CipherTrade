@@ -127,6 +127,8 @@ async def update_requirement(
         updated = await requirement_service.update_requirement(db, req, data, current_user.id)
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return RequirementRead.model_validate(updated)
 
 
@@ -148,5 +150,7 @@ async def close_requirement(
         await requirement_service.close_requirement(db, req, current_user.id)
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

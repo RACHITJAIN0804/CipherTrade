@@ -20,13 +20,14 @@ import { isAddress, getAddress, parseEther } from 'ethers';
 import { useWallet } from '../../context/WalletContext';
 import {
   fundEscrowDeal,
-  generateAgreementHash,
   formatContractError,
   type FundDealResult,
 } from '../../services/contractService';
 import {
   createEscrowDeal,
   verifyFunding,
+  getCanonicalAgreement,
+  getCanonicalAgreementByOffer,
 } from '../../services/escrowService';
 import { getUser } from '../../services/userService';
 
@@ -69,7 +70,7 @@ export function FundEscrowModal({
   sellerAddress: initialSellerAddress = '',
   amountEth: initialAmountEth = '',
   deliveryDeadline: initialDeadline = 0,
-  terms = '',
+  terms: _terms = '',
   agreementHash: initialAgreementHash = '',
   onSuccess,
 }: FundEscrowModalProps) {
@@ -93,8 +94,9 @@ export function FundEscrowModal({
   const [checkingSellerWallet, setCheckingSellerWallet] = useState(false);
   const [amount, setAmount] = useState('');
   const [deadlineDate, setDeadlineDate] = useState('');
-  const [customHash, setCustomHash] = useState('');
-  const [useAutoHash, setUseAutoHash] = useState(true);
+  const [authoritativeHash, setAuthoritativeHash] = useState<string>(initialAgreementHash || '');
+  const [isLoadingAgreement, setIsLoadingAgreement] = useState(false);
+  const [agreementError, setAgreementError] = useState<string | null>(null);
 
   // Backend Deal ID (UUID)
   const [activeDealId, setActiveDealId] = useState<string>(initialDealId);
@@ -132,12 +134,36 @@ export function FundEscrowModal({
         setDeadlineDate(tomorrow.toISOString().slice(0, 16));
       }
 
+      // Fetch or initialize authoritative agreement hash from backend (Phase 5D.2)
       if (initialAgreementHash) {
-        setCustomHash(initialAgreementHash);
-        setUseAutoHash(false);
+        setAuthoritativeHash(initialAgreementHash);
+      } else if (initialDealId) {
+        setIsLoadingAgreement(true);
+        setAgreementError(null);
+        getCanonicalAgreement(initialDealId)
+          .then((res) => {
+            setAuthoritativeHash(res.agreement_hash);
+          })
+          .catch((err) => {
+            setAgreementError((err as Error).message || 'Failed to fetch authoritative agreement hash.');
+          })
+          .finally(() => setIsLoadingAgreement(false));
+      } else if (offerId) {
+        setIsLoadingAgreement(true);
+        setAgreementError(null);
+        getCanonicalAgreementByOffer(offerId)
+          .then((res) => {
+            setAuthoritativeHash(res.agreement_hash);
+            if (res.deal_id) {
+              setActiveDealId(res.deal_id);
+            }
+          })
+          .catch((err) => {
+            setAgreementError((err as Error).message || 'Failed to fetch authoritative agreement hash.');
+          })
+          .finally(() => setIsLoadingAgreement(false));
       } else {
-        setCustomHash('');
-        setUseAutoHash(true);
+        setAuthoritativeHash('');
       }
 
       // Check seller registered wallet if sellerId is provided
@@ -163,6 +189,7 @@ export function FundEscrowModal({
   }, [
     open,
     initialDealId,
+    offerId,
     sellerId,
     initialSellerAddress,
     initialAmountEth,
@@ -170,11 +197,9 @@ export function FundEscrowModal({
     initialAgreementHash,
   ]);
 
-  // Compute active agreement hash
+  // Active agreement hash (authoritative backend fingerprint)
   const computedDeadlineTs = deadlineDate ? Math.floor(new Date(deadlineDate).getTime() / 1000) : 0;
-  const effectiveHash = useAutoHash
-    ? generateAgreementHash(offerId || 'generic', terms || 'standard', amount || '0', computedDeadlineTs)
-    : customHash.trim();
+  const effectiveHash = authoritativeHash.trim();
 
   // Copy helpers
   const handleCopy = (text: string, type: 'hash' | 'tx' | 'dealId') => {
@@ -218,6 +243,8 @@ export function FundEscrowModal({
     isAmountValid &&
     isDeadlineValid &&
     isHashValid &&
+    !isLoadingAgreement &&
+    !agreementError &&
     !isSelfDeal &&
     step === 'form';
 
@@ -283,9 +310,6 @@ export function FundEscrowModal({
         try {
           const dealRecord = await createEscrowDeal({
             offer_id: offerId,
-            amount_eth: parseFloat(amount),
-            deadline_ts: computedDeadlineTs,
-            agreement_hash: effectiveHash,
           });
           targetDealId = dealRecord.id;
           setActiveDealId(dealRecord.id);
@@ -498,39 +522,41 @@ export function FundEscrowModal({
             {/* Agreement Hash */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
-                <label className="font-medium text-slate-300">Agreement Hash (Integrity Fingerprint)</label>
-                <button
-                  type="button"
-                  onClick={() => setUseAutoHash(!useAutoHash)}
-                  className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
-                >
-                  {useAutoHash ? 'Enter Custom Hash' : 'Auto-Generate Hash'}
-                </button>
+                <label className="font-medium text-slate-300">Agreement Hash (Authoritative)</label>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  Backend Canonical v1
+                </span>
               </div>
 
-              {useAutoHash ? (
-                <div className="p-3 rounded-lg bg-slate-900/80 border border-slate-800 flex items-center justify-between gap-2">
-                  <div className="truncate font-mono text-xs text-slate-300">
-                    {effectiveHash}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(effectiveHash, 'hash')}
-                    className="p-1.5 text-slate-400 hover:text-white rounded hover:bg-slate-800 shrink-0"
-                    title="Copy agreement hash"
-                  >
-                    {copiedHash ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
-                  </button>
+              {isLoadingAgreement ? (
+                <div className="p-3 rounded-lg bg-slate-900/80 border border-slate-800 text-xs text-slate-400 flex items-center gap-2">
+                  <div className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                  <span>Computing canonical agreement hash from accepted terms...</span>
+                </div>
+              ) : agreementError ? (
+                <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-800/50 text-xs text-rose-300">
+                  {agreementError}
                 </div>
               ) : (
-                <Input
-                  placeholder="0x..."
-                  value={customHash}
-                  onChange={(e) => setCustomHash(e.target.value)}
-                  error={customHash && !isHashValid ? 'Must be a 32-byte hex string (0x + 64 hex chars)' : undefined}
-                  hint="32-byte keccak256 hash representing deal terms"
-                />
+                <div className="p-3 rounded-lg bg-slate-900/80 border border-slate-800 flex items-center justify-between gap-2">
+                  <div className="truncate font-mono text-xs text-emerald-300/90" title={effectiveHash}>
+                    {effectiveHash || 'No agreement hash available'}
+                  </div>
+                  {effectiveHash && (
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(effectiveHash, 'hash')}
+                      className="p-1.5 text-slate-400 hover:text-white rounded hover:bg-slate-800 shrink-0 transition-colors"
+                      title="Copy canonical agreement hash"
+                    >
+                      {copiedHash ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                    </button>
+                  )}
+                </div>
               )}
+              <p className="text-[11px] text-slate-500">
+                Authoritative Keccak-256 fingerprint deterministically computed by backend from immutable terms.
+              </p>
             </div>
 
             {/* Buyer Wallet & Summary Box */}

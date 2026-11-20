@@ -64,9 +64,6 @@ async def test_buyer_deals_listing_and_isolation(client: AsyncClient):
         "/api/v1/escrow/deals",
         json={
             "offer_id": offer_id,
-            "amount_eth": 2.5,
-            "deadline_ts": deadline,
-            "agreement_hash": "0x" + "a" * 64,
         },
         headers={"Authorization": f"Bearer {buyer1_token}"},
     )
@@ -141,9 +138,6 @@ async def test_seller_deals_listing_and_isolation(client: AsyncClient):
         "/api/v1/escrow/deals",
         json={
             "offer_id": offer_id,
-            "amount_eth": 3.0,
-            "deadline_ts": deadline,
-            "agreement_hash": "0x" + "b" * 64,
         },
         headers={"Authorization": f"Bearer {buyer_token}"},
     )
@@ -209,9 +203,6 @@ async def test_escrow_deal_detail_permissions_and_sync(client: AsyncClient):
         "/api/v1/escrow/deals",
         json={
             "offer_id": offer_id,
-            "amount_eth": 1.25,
-            "deadline_ts": deadline,
-            "agreement_hash": "0x" + "c" * 64,
         },
         headers={"Authorization": f"Bearer {buyer_token}"},
     )
