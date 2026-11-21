@@ -23,8 +23,14 @@ from app.schemas.escrow import (
     PaginatedEscrowDeals,
     VerifyFundingRequest,
 )
+from app.schemas.consent import (
+    ConsentChallengeResponse,
+    ConsentStatusResponse,
+    ConsentVerifyRequest,
+    ConsentVerifyResponse,
+)
 from app.services.auth_deps import get_current_user
-from app.services import agreement_service, escrow_service, offer_service
+from app.services import agreement_service, consent_service, escrow_service, offer_service
 
 logger = logging.getLogger(__name__)
 
@@ -492,3 +498,169 @@ async def get_offer_agreement(
         canonical_agreement=canonical_dict,
         schema_version=agreement_service.CANONICAL_AGREEMENT_SCHEMA_VERSION,
     )
+
+
+# ---------------------------------------------------------------------------
+# Cryptographic Agreement Consent Endpoints (Phase 5D.3: EIP-712)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/offers/{offer_id}/consent",
+    response_model=ConsentStatusResponse,
+    summary="Get cryptographic consent status for an offer agreement",
+)
+async def get_offer_consent_status(
+    offer_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentStatusResponse:
+    stmt = (
+        select(Offer)
+        .where(Offer.id == offer_id)
+        .options(selectinload(Offer.requirement))
+    )
+    offer = (await db.execute(stmt)).scalar_one_or_none()
+    if offer is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offer not found.")
+    if offer.requirement is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requirement not found.")
+    if offer.requirement.buyer_id != current_user.id and offer.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        return await consent_service.get_consent_status(db, offer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get(
+    "/deals/{deal_id}/consent",
+    response_model=ConsentStatusResponse,
+    summary="Get cryptographic consent status for an escrow deal agreement",
+)
+async def get_deal_consent_status(
+    deal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentStatusResponse:
+    deal = (await db.execute(select(EscrowDeal).where(EscrowDeal.id == deal_id))).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
+    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        return await consent_service.get_consent_status(db, deal.offer_id, deal_id=deal.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post(
+    "/offers/{offer_id}/consent/challenge",
+    response_model=ConsentChallengeResponse,
+    summary="Request an EIP-712 agreement consent challenge for an offer",
+)
+async def request_offer_consent_challenge(
+    offer_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentChallengeResponse:
+    try:
+        return await consent_service.create_consent_challenge(
+            db, user=current_user, offer_id=offer_id
+        )
+    except consent_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post(
+    "/deals/{deal_id}/consent/challenge",
+    response_model=ConsentChallengeResponse,
+    summary="Request an EIP-712 agreement consent challenge for an escrow deal",
+)
+async def request_deal_consent_challenge(
+    deal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentChallengeResponse:
+    deal = (await db.execute(select(EscrowDeal).where(EscrowDeal.id == deal_id))).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
+    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        return await consent_service.create_consent_challenge(
+            db, user=current_user, offer_id=deal.offer_id, deal_id=deal.id
+        )
+    except consent_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post(
+    "/offers/{offer_id}/consent/verify",
+    response_model=ConsentVerifyResponse,
+    summary="Submit signed EIP-712 challenge to record agreement consent for an offer",
+)
+async def verify_offer_consent(
+    offer_id: uuid.UUID,
+    data: ConsentVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentVerifyResponse:
+    try:
+        return await consent_service.verify_and_record_consent(
+            db=db,
+            user=current_user,
+            offer_id=offer_id,
+            nonce=data.nonce,
+            signature=data.signature,
+        )
+    except consent_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post(
+    "/deals/{deal_id}/consent/verify",
+    response_model=ConsentVerifyResponse,
+    summary="Submit signed EIP-712 challenge to record agreement consent for a deal",
+)
+async def verify_deal_consent(
+    deal_id: uuid.UUID,
+    data: ConsentVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ConsentVerifyResponse:
+    deal = (await db.execute(select(EscrowDeal).where(EscrowDeal.id == deal_id))).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
+    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    try:
+        return await consent_service.verify_and_record_consent(
+            db=db,
+            user=current_user,
+            offer_id=deal.offer_id,
+            nonce=data.nonce,
+            signature=data.signature,
+            deal_id=deal.id,
+        )
+    except consent_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

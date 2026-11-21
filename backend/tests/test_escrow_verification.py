@@ -122,18 +122,52 @@ async def _create_deal(
     assert acc_resp.status_code == 200
 
     # 4. Buyer creates escrow deal
+    deal_payload: dict[str, Any] = {"offer_id": offer_id}
+    if agreement_hash and agreement_hash != "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef":
+        deal_payload["agreement_hash"] = agreement_hash
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
-        json={
-            "offer_id": offer_id,
-            "amount_eth": amount_eth,
-            "deadline_ts": deadline,
-            "agreement_hash": agreement_hash,
-        },
+        json=deal_payload,
         headers={"Authorization": f"Bearer {buyer_token}"},
     )
     assert deal_resp.status_code == 201
-    return deal_resp.json(), deadline
+    deal_data = deal_resp.json()
+
+    # Sign agreement consent for both parties (Phase 5D.3)
+    for token in [buyer_token, seller_token]:
+        ch_resp = await client.post(
+            f"/api/v1/escrow/deals/{deal_data['id']}/consent/challenge",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if ch_resp.status_code == 200:
+            ch_data = ch_resp.json()
+            signer_addr = ch_data["message"]["signer"].lower()
+            pk = KNOWN_TEST_KEYS.get(signer_addr)
+            if pk:
+                eip712_msg = {
+                    "types": {
+                        "EIP712Domain": [
+                            {"name": "name", "type": "string"},
+                            {"name": "version", "type": "string"},
+                            {"name": "chainId", "type": "uint256"},
+                            {"name": "verifyingContract", "type": "address"},
+                        ],
+                        "AgreementConsent": ch_data["types"]["AgreementConsent"],
+                    },
+                    "primaryType": "AgreementConsent",
+                    "domain": ch_data["domain"],
+                    "message": ch_data["message"],
+                }
+                from eth_account.messages import encode_typed_data
+                raw_sig = Account.from_key(pk).sign_message(encode_typed_data(full_message=eip712_msg)).signature.hex()
+                sig = ("0x" + raw_sig) if not raw_sig.startswith("0x") else raw_sig
+                await client.post(
+                    f"/api/v1/escrow/deals/{deal_data['id']}/consent/verify",
+                    json={"nonce": ch_data["nonce"], "signature": sig},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+    return deal_data, deadline
 
 
 # ─── Unit / Health Tests ──────────────────────────────────────────────────────

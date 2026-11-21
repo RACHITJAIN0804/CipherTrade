@@ -438,3 +438,82 @@ class WalletChallenge(Base):
     )
 
     user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+
+
+class AgreementConsentChallenge(Base):
+    """
+    Cryptographic challenge for agreement consent (EIP-712 typed-data).
+    Tied to an authenticated user and specific accepted offer/agreement_hash, single-use, with strict expiration.
+    """
+    __tablename__ = "agreement_consent_challenges"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=_uuid
+    )
+    offer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("offers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    deal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("escrow_deals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    party_role: Mapped[str] = mapped_column(String(16), nullable=False)
+    wallet_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    agreement_hash: Mapped[str] = mapped_column(String(66), nullable=False, index=True)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    deadline: Mapped[int] = mapped_column(Integer, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    offer: Mapped["Offer"] = relationship("Offer", foreign_keys=[offer_id])
+    deal: Mapped["EscrowDeal | None"] = relationship("EscrowDeal", foreign_keys=[deal_id])
+
+
+class AgreementConsent(Base):
+    """
+    Verified cryptographic consent record for an agreement (EIP-712 signature).
+    Enforces that buyer and seller independently sign the exact same canonical agreement_hash.
+    """
+    __tablename__ = "agreement_consents"
+    __table_args__ = (
+        UniqueConstraint("offer_id", "party_role", name="uq_offer_party_consent"),
+        Index("ix_agreement_consents_offer", "offer_id"),
+        Index("ix_agreement_consents_deal", "deal_id"),
+        Index("ix_agreement_consents_hash", "agreement_hash"),
+        Index("ix_agreement_consents_nonce", "nonce", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=_uuid
+    )
+    offer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("offers.id", ondelete="CASCADE"), nullable=False
+    )
+    deal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("escrow_deals.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    party_role: Mapped[str] = mapped_column(String(16), nullable=False)  # "buyer" or "seller"
+    signer_wallet: Mapped[str] = mapped_column(String(42), nullable=False)
+    agreement_hash: Mapped[str] = mapped_column(String(66), nullable=False)
+    chain_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    signature: Mapped[str] = mapped_column(String(132), nullable=False)
+    deadline: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    offer: Mapped["Offer"] = relationship("Offer", foreign_keys=[offer_id])
+    deal: Mapped["EscrowDeal | None"] = relationship("EscrowDeal", foreign_keys=[deal_id])

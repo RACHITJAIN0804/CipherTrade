@@ -631,6 +631,40 @@ async def test_transaction_verification_enforces_backend_canonical_hash(client: 
     deal_id = deal["id"]
     canonical_hash = deal["agreement_hash"]
 
+    # Pre-requisite for funding: Both buyer and seller cryptographically consent to canonical agreement (Phase 5D.3)
+    buyer_pk = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+    seller_pk = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+    for token, pk in [(buyer_token, buyer_pk), (seller_token, seller_pk)]:
+        ch_resp = await client.post(
+            f"/api/v1/escrow/deals/{deal_id}/consent/challenge",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ch_resp.status_code == 200
+        ch_data = ch_resp.json()
+        eip712_msg = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "AgreementConsent": ch_data["types"]["AgreementConsent"],
+            },
+            "primaryType": "AgreementConsent",
+            "domain": ch_data["domain"],
+            "message": ch_data["message"],
+        }
+        from eth_account.messages import encode_typed_data
+        raw_sig = Account.from_key(pk).sign_message(encode_typed_data(full_message=eip712_msg)).signature.hex()
+        sig = ("0x" + raw_sig) if not raw_sig.startswith("0x") else raw_sig
+        v_resp = await client.post(
+            f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+            json={"nonce": ch_data["nonce"], "signature": sig},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert v_resp.status_code == 200
+
     # Test 1: On-chain transaction has a MISMATCHED agreement hash -> Must be rejected
     mismatched_hash = "0x" + "ee" * 32
     fake_tx = "0x" + "d" * 64

@@ -16,6 +16,64 @@ export interface CanonicalAgreementResponse {
   schema_version: string;
 }
 
+export interface ConsentPartyDetail {
+  user_id: string;
+  wallet_address: string;
+  signed_at: string;
+  chain_id: number;
+  agreement_hash: string;
+}
+
+export interface ConsentStatusResponse {
+  offer_id: string;
+  deal_id?: string | null;
+  agreement_hash: string;
+  buyer_consented: boolean;
+  seller_consented: boolean;
+  both_consented: boolean;
+  can_fund: boolean;
+  buyer_consent?: ConsentPartyDetail | null;
+  seller_consent?: ConsentPartyDetail | null;
+}
+
+export interface ConsentChallengeResponse {
+  domain: {
+    name: string;
+    version: string;
+    chainId: number;
+    verifyingContract: string;
+  };
+  types: Record<string, Array<{ name: string; type: string }>>;
+  primary_type: string;
+  message: {
+    agreementHash: string;
+    offerId: string;
+    dealId: string;
+    partyRole: string;
+    signer: string;
+    nonce: string;
+    deadline: number;
+  };
+  nonce: string;
+  deadline: number;
+}
+
+export interface ConsentVerifyRequest {
+  nonce: string;
+  signature: string;
+}
+
+export interface ConsentVerifyResponse {
+  status: string;
+  offer_id: string;
+  deal_id?: string | null;
+  party_role: string;
+  signer_wallet: string;
+  agreement_hash: string;
+  both_consented: boolean;
+  can_fund: boolean;
+}
+
 export interface VerifyFundingPayload {
   tx_hash: string;
 }
@@ -105,5 +163,48 @@ export async function getCanonicalAgreement(dealId: string): Promise<CanonicalAg
  */
 export async function getCanonicalAgreementByOffer(offerId: string): Promise<CanonicalAgreementResponse> {
   const res = await apiClient.get<CanonicalAgreementResponse>(`/escrow/offers/${offerId}/agreement`);
+  return res.data;
+}
+
+/**
+ * Fetch cryptographic agreement consent status for an escrow deal or offer.
+ */
+export async function getConsentStatus(
+  targetId: string,
+  isOfferId = false
+): Promise<ConsentStatusResponse> {
+  const endpoint = isOfferId
+    ? `/escrow/offers/${targetId}/consent`
+    : `/escrow/deals/${targetId}/consent`;
+  const res = await apiClient.get<ConsentStatusResponse>(endpoint);
+  return res.data;
+}
+
+/**
+ * Request an EIP-712 agreement consent challenge for an escrow deal or offer.
+ */
+export async function requestConsentChallenge(
+  targetId: string,
+  isOfferId = false
+): Promise<ConsentChallengeResponse> {
+  const endpoint = isOfferId
+    ? `/escrow/offers/${targetId}/consent/challenge`
+    : `/escrow/deals/${targetId}/consent/challenge`;
+  const res = await apiClient.post<ConsentChallengeResponse>(endpoint);
+  return res.data;
+}
+
+/**
+ * Submit signed EIP-712 challenge to record agreement consent.
+ */
+export async function verifyConsentSignature(
+  targetId: string,
+  payload: ConsentVerifyRequest,
+  isOfferId = false
+): Promise<ConsentVerifyResponse> {
+  const endpoint = isOfferId
+    ? `/escrow/offers/${targetId}/consent/verify`
+    : `/escrow/deals/${targetId}/consent/verify`;
+  const res = await apiClient.post<ConsentVerifyResponse>(endpoint, payload);
   return res.data;
 }

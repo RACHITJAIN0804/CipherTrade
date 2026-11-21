@@ -28,6 +28,10 @@ import {
   verifyFunding,
   getCanonicalAgreement,
   getCanonicalAgreementByOffer,
+  getConsentStatus,
+  requestConsentChallenge,
+  verifyConsentSignature,
+  type ConsentStatusResponse,
 } from '../../services/escrowService';
 import { getUser } from '../../services/userService';
 
@@ -112,6 +116,13 @@ export function FundEscrowModal({
   const [copiedTx, setCopiedTx] = useState(false);
   const [copiedDealId, setCopiedDealId] = useState(false);
 
+  // Cryptographic Consent (Phase 5D.3)
+  const [consentStatus, setConsentStatus] = useState<ConsentStatusResponse | null>(null);
+  const [isLoadingConsent, setIsLoadingConsent] = useState(false);
+  const [isSigningConsent, setIsSigningConsent] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+  const [consentSuccess, setConsentSuccess] = useState<string | null>(null);
+
   // Initialize form state when modal opens
   useEffect(() => {
     if (open) {
@@ -185,6 +196,19 @@ export function FundEscrowModal({
             setCheckingSellerWallet(false);
           });
       }
+
+      // Fetch initial cryptographic consent status (Phase 5D.3)
+      setConsentStatus(null);
+      setConsentError(null);
+      setConsentSuccess(null);
+      const targetConsentId = initialDealId || offerId;
+      if (targetConsentId) {
+        setIsLoadingConsent(true);
+        getConsentStatus(targetConsentId, !initialDealId && Boolean(offerId))
+          .then((res) => setConsentStatus(res))
+          .catch(() => setConsentStatus(null))
+          .finally(() => setIsLoadingConsent(false));
+      }
     }
   }, [
     open,
@@ -196,6 +220,85 @@ export function FundEscrowModal({
     initialDeadline,
     initialAgreementHash,
   ]);
+
+  const refreshConsentStatus = async (targetIdOverride?: string, isOfferOverride?: boolean) => {
+    const targetId = targetIdOverride || activeDealId || offerId;
+    if (!targetId) return;
+    setIsLoadingConsent(true);
+    try {
+      const isOffer = isOfferOverride !== undefined ? isOfferOverride : (!activeDealId && Boolean(offerId));
+      const res = await getConsentStatus(targetId, isOffer);
+      setConsentStatus(res);
+      if (res.deal_id && !activeDealId) {
+        setActiveDealId(res.deal_id);
+      }
+    } catch (err: unknown) {
+      console.warn('Could not fetch consent status:', err);
+    } finally {
+      setIsLoadingConsent(false);
+    }
+  };
+
+  const handleSignConsent = async () => {
+    if (!signer || !account) {
+      setConsentError('Please connect your MetaMask wallet first.');
+      return;
+    }
+    if (!isCorrectNetwork) {
+      setConsentError('Please switch to Anvil Local network (Chain ID 31337).');
+      return;
+    }
+    const targetId = activeDealId || offerId;
+    if (!targetId) {
+      setConsentError('No active deal or offer found to sign.');
+      return;
+    }
+
+    setIsSigningConsent(true);
+    setConsentError(null);
+    setConsentSuccess(null);
+
+    try {
+      const isOffer = !activeDealId && Boolean(offerId);
+      const challenge = await requestConsentChallenge(targetId, isOffer);
+
+      // Verify connected wallet matches challenge signer
+      if (getAddress(account).toLowerCase() !== getAddress(challenge.message.signer).toLowerCase()) {
+        throw new Error(
+          `Connected wallet (${formatAddress(account)}) does not match registered account wallet (${formatAddress(challenge.message.signer)}). Please switch accounts in MetaMask.`
+        );
+      }
+
+      // Sign EIP-712 typed-data
+      const typesToSign = {
+        AgreementConsent: challenge.types.AgreementConsent,
+      };
+
+      const signature = await signer.signTypedData(
+        challenge.domain,
+        typesToSign,
+        challenge.message
+      );
+
+      // Verify and record consent
+      const verifyRes = await verifyConsentSignature(
+        targetId,
+        { nonce: challenge.nonce, signature },
+        isOffer
+      );
+
+      setConsentSuccess(`Agreement cryptographically signed as ${verifyRes.party_role}!`);
+      await refreshConsentStatus(targetId, isOffer);
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
+        (err as Error)?.message ??
+        'Failed to cryptographically sign agreement.';
+      setConsentError(msg);
+    } finally {
+      setIsSigningConsent(false);
+    }
+  };
 
   // Active agreement hash (authoritative backend fingerprint)
   const computedDeadlineTs = deadlineDate ? Math.floor(new Date(deadlineDate).getTime() / 1000) : 0;
@@ -235,6 +338,8 @@ export function FundEscrowModal({
       getAddress(sellerAddr).toLowerCase() !== getAddress(registeredSellerWallet).toLowerCase()
   );
 
+  const bothConsented = Boolean(consentStatus?.both_consented);
+
   const canSubmit =
     isConnected &&
     isCorrectNetwork &&
@@ -246,6 +351,7 @@ export function FundEscrowModal({
     !isLoadingAgreement &&
     !agreementError &&
     !isSelfDeal &&
+    bothConsented &&
     step === 'form';
 
   /**
@@ -291,6 +397,14 @@ export function FundEscrowModal({
     try {
       setErrorMessage(null);
       setVerificationError(null);
+
+      // Pre-flight 0: Ensure mutual agreement consent exists (Phase 5D.3)
+      if (!consentStatus?.both_consented) {
+        setErrorMessage(
+          'Both buyer and seller must cryptographically consent to the agreement terms before escrow funding can proceed.'
+        );
+        return;
+      }
 
       // Pre-flight 1: Ensure buyer's wallet is cryptographically verified via EIP-4361 SIWE
       if (!isWalletVerified) {
@@ -559,6 +673,110 @@ export function FundEscrowModal({
               </p>
             </div>
 
+            {/* Cryptographic Agreement Consent (EIP-712) */}
+            <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between text-sm">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                  <span className="font-medium text-slate-200">Cryptographic Agreement Consent</span>
+                </div>
+                <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                  EIP-712 Typed Signatures
+                </span>
+              </div>
+
+              <p className="text-xs text-slate-400">
+                Both parties must cryptographically sign and approve the exact same canonical agreement terms prior to escrow funding.
+              </p>
+
+              {/* Consent Badges for Buyer and Seller */}
+              <div className="grid grid-cols-2 gap-3 pt-1">
+                <div
+                  className={`p-3 rounded-lg border text-xs flex items-center justify-between ${
+                    consentStatus?.buyer_consented
+                      ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+                      : 'bg-slate-950/40 border-slate-800 text-slate-400'
+                  }`}
+                >
+                  <div>
+                    <p className="font-semibold text-slate-200">Buyer Consent</p>
+                    <p className="text-[11px] text-slate-400 truncate max-w-[120px]">
+                      {consentStatus?.buyer_consent?.wallet_address
+                        ? formatAddress(consentStatus.buyer_consent.wallet_address)
+                        : 'Pending signature'}
+                    </p>
+                  </div>
+                  {consentStatus?.buyer_consented ? (
+                    <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded">
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Signed
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-[11px] font-medium text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded">
+                      <Clock className="w-3.5 h-3.5" /> Pending
+                    </span>
+                  )}
+                </div>
+
+                <div
+                  className={`p-3 rounded-lg border text-xs flex items-center justify-between ${
+                    consentStatus?.seller_consented
+                      ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+                      : 'bg-slate-950/40 border-slate-800 text-slate-400'
+                  }`}
+                >
+                  <div>
+                    <p className="font-semibold text-slate-200">Seller Consent</p>
+                    <p className="text-[11px] text-slate-400 truncate max-w-[120px]">
+                      {consentStatus?.seller_consent?.wallet_address
+                        ? formatAddress(consentStatus.seller_consent.wallet_address)
+                        : 'Pending signature'}
+                    </p>
+                  </div>
+                  {consentStatus?.seller_consented ? (
+                    <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded">
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Signed
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1 text-[11px] font-medium text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded">
+                      <Clock className="w-3.5 h-3.5" /> Pending
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Status alerts */}
+              {consentError && (
+                <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-800/50 text-xs text-rose-300 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{consentError}</span>
+                </div>
+              )}
+
+              {consentSuccess && (
+                <div className="p-3 rounded-lg bg-emerald-950/30 border border-emerald-800/50 text-xs text-emerald-300 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>{consentSuccess}</span>
+                </div>
+              )}
+
+              {/* User Signing Button if current party hasn't signed */}
+              {(!consentStatus?.buyer_consented || !consentStatus?.seller_consented) && (
+                <div className="pt-1">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    className="w-full justify-center"
+                    onClick={handleSignConsent}
+                    loading={isSigningConsent || isLoadingConsent}
+                    leftIcon={<ShieldCheck className="w-4 h-4 text-cyan-400" />}
+                  >
+                    Review & Sign Agreement (EIP-712)
+                  </Button>
+                </div>
+              )}
+            </div>
+
             {/* Buyer Wallet & Summary Box */}
             <div className="p-4 rounded-xl bg-slate-900/40 border border-slate-800/80 space-y-2 text-xs">
               <div className="flex justify-between text-slate-400">
@@ -588,7 +806,7 @@ export function FundEscrowModal({
                 disabled={!canSubmit}
                 leftIcon={<ShieldCheck className="w-4 h-4" />}
               >
-                Deposit & Fund Escrow
+                {!bothConsented ? 'Consent Required Before Funding' : 'Deposit & Fund Escrow'}
               </Button>
             </div>
           </div>

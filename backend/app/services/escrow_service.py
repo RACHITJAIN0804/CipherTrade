@@ -332,6 +332,17 @@ async def verify_funding_transaction(
     if event_hash_hex.lower() != expected_hash:
         raise ValueError(f"Agreement hash mismatch. Expected {expected_hash}, got {event_hash_hex}.")
 
+    # 17.5. Verify cryptographic consent from both buyer and seller (Phase 5D.3)
+    from app.services import consent_service
+    has_both_consents = await consent_service.check_both_parties_consented(
+        db, deal.offer_id, expected_hash
+    )
+    if not has_both_consents:
+        raise PermissionError(
+            "Escrow funding cannot be verified: both buyer and seller must cryptographically "
+            "sign and consent to the canonical agreement terms prior to funding."
+        )
+
     # 18. Cross-check stored deal on the smart contract getter getDeal(dealId)
     try:
         on_chain_deal = contract.functions.getDeal(chain_deal_id).call()
