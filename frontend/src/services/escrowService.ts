@@ -1,4 +1,5 @@
 import { apiClient } from './api.ts';
+import { ESCROW_CHAIN_ID, ESCROW_CONTRACT_ADDRESS } from '../config/contracts.ts';
 import type { EscrowDeal, EscrowTransaction, PaginatedEscrowDeals, EscrowState } from '../types';
 
 export interface EscrowDealCreate {
@@ -207,4 +208,45 @@ export async function verifyConsentSignature(
     : `/escrow/deals/${targetId}/consent/verify`;
   const res = await apiClient.post<ConsentVerifyResponse>(endpoint, payload);
   return res.data;
+}
+
+/**
+ * Validates EIP-712 challenge domain parameters against local escrow contract configuration
+ * and verifies that the connected wallet network matches before presenting the signature request.
+ */
+export function validateConsentDomain(
+  domain: ConsentChallengeResponse['domain'],
+  connectedChainId?: number | null
+): void {
+  if (!domain) {
+    throw new Error('Invalid consent challenge: domain object is missing.');
+  }
+  if (domain.name !== 'CipherTrade') {
+    throw new Error(`Untrusted consent domain name "${domain.name}". Expected "CipherTrade".`);
+  }
+  if (domain.version !== '1') {
+    throw new Error(`Unsupported consent domain version "${domain.version}". Expected "1".`);
+  }
+  if (Number(domain.chainId) !== ESCROW_CHAIN_ID) {
+    throw new Error(
+      `Consent challenge chain ID (${domain.chainId}) does not match expected escrow network (${ESCROW_CHAIN_ID}).`
+    );
+  }
+  if (
+    !domain.verifyingContract ||
+    domain.verifyingContract.toLowerCase() !== ESCROW_CONTRACT_ADDRESS.toLowerCase()
+  ) {
+    throw new Error(
+      `Consent challenge contract address (${domain.verifyingContract}) does not match configured escrow contract (${ESCROW_CONTRACT_ADDRESS}).`
+    );
+  }
+  if (
+    connectedChainId !== undefined &&
+    connectedChainId !== null &&
+    Number(connectedChainId) !== ESCROW_CHAIN_ID
+  ) {
+    throw new Error(
+      `Connected wallet network (${connectedChainId}) does not match required escrow network (${ESCROW_CHAIN_ID}).`
+    );
+  }
 }

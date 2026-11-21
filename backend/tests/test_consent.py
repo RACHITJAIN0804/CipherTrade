@@ -608,3 +608,210 @@ async def test_funding_blocked_without_both_consents(client: AsyncClient):
         )
         assert resp_ok.status_code == 200
         assert resp_ok.json()["on_chain_state"] == "FUNDED"
+
+
+# ===========================================================================
+# Phase 5D.3.1: Security Hardening & Concurrency Tests
+# ===========================================================================
+
+@pytest.mark.asyncio
+async def test_concurrent_challenge_verification(client: AsyncClient, db_session: AsyncSession):
+    """
+    Phase 5D.3.1: Concurrency test verifying that race conditions during challenge verification
+    are handled atomically.
+    Exactly one concurrent request can consume the nonce (200 OK);
+    the other receives HTTP 400 with a replay/already-consumed error.
+    Exactly one AgreementConsent record is persisted.
+    """
+    import asyncio
+    from sqlalchemy import select, func
+    from app.models.models import AgreementConsent
+
+    ctx = await _setup_deal(client)
+    deal_id = ctx["deal_id"]
+    offer_id = ctx["offer_id"]
+
+    # Request challenge for buyer
+    b_ch_resp = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/challenge",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert b_ch_resp.status_code == 200
+    b_ch = b_ch_resp.json()
+    b_sig = _sign_eip712_challenge(b_ch, BUYER_PK)
+
+    # Launch two concurrent verify requests for the exact same nonce & signature
+    req1 = client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+        json={"nonce": b_ch["nonce"], "signature": b_sig},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    req2 = client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+        json={"nonce": b_ch["nonce"], "signature": b_sig},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+
+    resp1, resp2 = await asyncio.gather(req1, req2)
+    statuses = sorted([resp1.status_code, resp2.status_code])
+    assert statuses == [200, 400], f"Expected [200, 400], got {statuses}"
+
+    failed_resp = resp1 if resp1.status_code == 400 else resp2
+    assert "already been consumed" in failed_resp.json()["detail"].lower()
+
+    # Verify exactly one consent record in database
+    stmt = select(func.count(AgreementConsent.id)).where(
+        AgreementConsent.offer_id == uuid.UUID(offer_id),
+        AgreementConsent.party_role == "buyer",
+    )
+    count = (await db_session.execute(stmt)).scalar()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_agreement_hash_drift_rejected(client: AsyncClient, db_session: AsyncSession):
+    """
+    Phase 5D.3.1: Verify that if authoritative agreement terms drift/mutate after challenge
+    generation, the challenge is invalidated upon verification (HTTP 400).
+    """
+    from sqlalchemy import update as sa_update
+    from app.models.models import Offer
+
+    ctx = await _setup_deal(client)
+    deal_id = ctx["deal_id"]
+    offer_id = ctx["offer_id"]
+
+    # Buyer requests challenge based on initial agreement
+    b_ch_resp = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/challenge",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert b_ch_resp.status_code == 200
+    b_ch = b_ch_resp.json()
+    b_sig = _sign_eip712_challenge(b_ch, BUYER_PK)
+
+    # Simulate out-of-band mutation to offer terms (hash drift)
+    await db_session.execute(
+        sa_update(Offer)
+        .where(Offer.id == uuid.UUID(offer_id))
+        .values(terms="Tampered / drifted terms that alter canonical agreement hash.")
+    )
+    await db_session.commit()
+
+    # Attempt to verify the challenge with original terms
+    v_resp = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+        json={"nonce": b_ch["nonce"], "signature": b_sig},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert v_resp.status_code == 400
+    assert "agreement terms have changed" in v_resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cross_deal_signature_reuse_rejected(client: AsyncClient):
+    """
+    Phase 5D.3.1: Verify that a valid EIP-712 consent signature and nonce from Deal A
+    cannot be reused or applied to Deal B.
+    """
+    # Setup Deal A
+    ctx = await _setup_deal(client)
+    deal_a_id = ctx["deal_id"]
+
+    # Setup Deal B under the same verified parties but with a distinct requirement and offer
+    req_b = (await client.post(
+        "/api/v1/requirements",
+        json={
+            "title": "Distinct Second Requirement",
+            "description": "Second contract engagement.",
+            "category": "security",
+        },
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )).json()
+
+    deadline_b = int(time.time()) + 86400 * 14
+    offer_b = (await client.post(
+        "/api/v1/offers",
+        json={
+            "requirement_id": req_b["id"],
+            "price_eth": 3.5,
+            "delivery_deadline": deadline_b,
+            "terms": "Distinct terms for engagement B.",
+        },
+        headers={"Authorization": f"Bearer {ctx['seller_token']}"},
+    )).json()
+
+    await client.post(
+        f"/api/v1/offers/{offer_b['id']}/accept",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+
+    deal_b = (await client.post(
+        "/api/v1/escrow/deals",
+        json={"offer_id": offer_b["id"]},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )).json()
+    deal_b_id = deal_b["id"]
+
+    # Deal A challenge and signature
+    ch_a = (await client.post(
+        f"/api/v1/escrow/deals/{deal_a_id}/consent/challenge",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )).json()
+    sig_a = _sign_eip712_challenge(ch_a, BUYER_PK)
+
+    # 1. Attempt to submit Deal A's nonce & signature to Deal B
+    cross_resp1 = await client.post(
+        f"/api/v1/escrow/deals/{deal_b_id}/consent/verify",
+        json={"nonce": ch_a["nonce"], "signature": sig_a},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert cross_resp1.status_code == 400
+    detail1 = cross_resp1.json()["detail"].lower()
+    assert "different offer" in detail1 or "not found" in detail1 or "invalid" in detail1
+
+    # 2. Deal B generates its own challenge, but client attempts to pass Deal A's signature
+    ch_b = (await client.post(
+        f"/api/v1/escrow/deals/{deal_b_id}/consent/challenge",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )).json()
+
+    cross_resp2 = await client.post(
+        f"/api/v1/escrow/deals/{deal_b_id}/consent/verify",
+        json={"nonce": ch_b["nonce"], "signature": sig_a},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert cross_resp2.status_code == 400
+    assert "signature mismatch" in cross_resp2.json()["detail"].lower() or "signature verification failed" in cross_resp2.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_wrong_verifying_contract_rejected(client: AsyncClient):
+    """
+    Phase 5D.3.1: Verify that signing with a tampered verifyingContract in the EIP-712 domain
+    separator produces a signature that fails verification against the expected contract address.
+    """
+    ctx = await _setup_deal(client)
+    deal_id = ctx["deal_id"]
+
+    ch_resp = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/challenge",
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert ch_resp.status_code == 200
+    ch = ch_resp.json()
+
+    # Tamper with the verifyingContract in the domain before signing
+    tampered_ch = dict(ch)
+    tampered_ch["domain"] = dict(ch["domain"])
+    tampered_ch["domain"]["verifyingContract"] = "0x0000000000000000000000000000000000000001"
+
+    tampered_sig = _sign_eip712_challenge(tampered_ch, BUYER_PK)
+
+    v_resp = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+        json={"nonce": ch["nonce"], "signature": tampered_sig},
+        headers={"Authorization": f"Bearer {ctx['buyer_token']}"},
+    )
+    assert v_resp.status_code == 400
+    assert "signature mismatch" in v_resp.json()["detail"].lower() or "signature verification failed" in v_resp.json()["detail"].lower()

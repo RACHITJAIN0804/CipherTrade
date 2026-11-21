@@ -2,9 +2,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Wallet, verifyTypedData, getAddress } from 'ethers';
 import { ESCROW_CHAIN_ID, ESCROW_CONTRACT_ADDRESS } from '../config/contracts.ts';
-import type {
-  ConsentStatusResponse,
-  ConsentChallengeResponse,
+import {
+  validateConsentDomain,
+  type ConsentStatusResponse,
+  type ConsentChallengeResponse,
 } from '../services/escrowService.ts';
 
 describe('Phase 5D.3: Cryptographic Agreement Consent (EIP-712)', () => {
@@ -72,6 +73,122 @@ describe('Phase 5D.3: Cryptographic Agreement Consent (EIP-712)', () => {
       assert.equal(challenge.message.agreementHash, MOCK_AGREEMENT_HASH);
       assert.equal(challenge.message.nonce.length, 64);
       assert.ok(challenge.message.deadline > Math.floor(Date.now() / 1000));
+    });
+
+    it('should successfully validate trusted domain with matching connected chain', () => {
+      const validDomain = {
+        name: 'CipherTrade',
+        version: '1',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: ESCROW_CONTRACT_ADDRESS,
+      };
+
+      assert.doesNotThrow(() => {
+        validateConsentDomain(validDomain, ESCROW_CHAIN_ID);
+      });
+    });
+
+    it('should accept valid domain with case-insensitive contract address', () => {
+      const validDomain = {
+        name: 'CipherTrade',
+        version: '1',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: ESCROW_CONTRACT_ADDRESS.toLowerCase(),
+      };
+
+      assert.doesNotThrow(() => {
+        validateConsentDomain(validDomain, ESCROW_CHAIN_ID);
+      });
+    });
+
+    it('should reject missing domain object', () => {
+      assert.throws(
+        () => {
+          // @ts-expect-error testing invalid input
+          validateConsentDomain(null, ESCROW_CHAIN_ID);
+        },
+        /Invalid consent challenge: domain object is missing/
+      );
+    });
+
+    it('should reject untrusted domain name', () => {
+      const invalidDomain = {
+        name: 'MaliciousApp',
+        version: '1',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: ESCROW_CONTRACT_ADDRESS,
+      };
+
+      assert.throws(
+        () => {
+          validateConsentDomain(invalidDomain, ESCROW_CHAIN_ID);
+        },
+        /Untrusted consent domain name "MaliciousApp"/
+      );
+    });
+
+    it('should reject unsupported domain version', () => {
+      const invalidDomain = {
+        name: 'CipherTrade',
+        version: '2',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: ESCROW_CONTRACT_ADDRESS,
+      };
+
+      assert.throws(
+        () => {
+          validateConsentDomain(invalidDomain, ESCROW_CHAIN_ID);
+        },
+        /Unsupported consent domain version "2"/
+      );
+    });
+
+    it('should reject mismatched challenge chainId', () => {
+      const invalidDomain = {
+        name: 'CipherTrade',
+        version: '1',
+        chainId: 1, // Mainnet instead of 31337
+        verifyingContract: ESCROW_CONTRACT_ADDRESS,
+      };
+
+      assert.throws(
+        () => {
+          validateConsentDomain(invalidDomain, ESCROW_CHAIN_ID);
+        },
+        /Consent challenge chain ID \(1\) does not match expected escrow network \(31337\)/
+      );
+    });
+
+    it('should reject untrusted verifyingContract address', () => {
+      const invalidDomain = {
+        name: 'CipherTrade',
+        version: '1',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: '0x0000000000000000000000000000000000000001',
+      };
+
+      assert.throws(
+        () => {
+          validateConsentDomain(invalidDomain, ESCROW_CHAIN_ID);
+        },
+        /Consent challenge contract address \(0x0000000000000000000000000000000000000001\) does not match configured escrow contract/
+      );
+    });
+
+    it('should reject when connected wallet network does not match required network', () => {
+      const validDomain = {
+        name: 'CipherTrade',
+        version: '1',
+        chainId: ESCROW_CHAIN_ID,
+        verifyingContract: ESCROW_CONTRACT_ADDRESS,
+      };
+
+      assert.throws(
+        () => {
+          validateConsentDomain(validDomain, 1); // Wallet is connected to Ethereum Mainnet (1)
+        },
+        /Connected wallet network \(1\) does not match required escrow network \(31337\)/
+      );
     });
   });
 

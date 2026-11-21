@@ -31,6 +31,7 @@ import {
   getConsentStatus,
   requestConsentChallenge,
   verifyConsentSignature,
+  validateConsentDomain,
   type ConsentStatusResponse,
 } from '../../services/escrowService';
 import { getUser } from '../../services/userService';
@@ -261,6 +262,9 @@ export function FundEscrowModal({
     try {
       const isOffer = !activeDealId && Boolean(offerId);
       const challenge = await requestConsentChallenge(targetId, isOffer);
+
+      // Validate EIP-712 challenge domain and connected chain before presenting signature prompt
+      validateConsentDomain(challenge.domain, chainId);
 
       // Verify connected wallet matches challenge signer
       if (getAddress(account).toLowerCase() !== getAddress(challenge.message.signer).toLowerCase()) {
