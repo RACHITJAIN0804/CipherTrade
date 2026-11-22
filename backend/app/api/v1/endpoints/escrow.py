@@ -28,6 +28,7 @@ from app.schemas.consent import (
     ConsentStatusResponse,
     ConsentVerifyRequest,
     ConsentVerifyResponse,
+    ContractFundingPayloadResponse,
 )
 from app.services.auth_deps import get_current_user
 from app.services import agreement_service, consent_service, escrow_service, offer_service
@@ -658,6 +659,38 @@ async def verify_deal_consent(
             signature=data.signature,
             deal_id=deal.id,
         )
+    except consent_service.ConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get(
+    "/deals/{deal_id}/contract-payload",
+    response_model=ContractFundingPayloadResponse,
+    summary="Get verified dual-consent contract funding payload for fundDealWithConsent",
+)
+async def get_contract_funding_payload(
+    deal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ContractFundingPayloadResponse:
+    """
+    Retrieve authoritative, contract-ready payload for CipherTradeEscrowV2.fundDealWithConsent.
+    Enforces all 15 verification steps. Read-only: does not consume nonces or mutate state.
+    """
+    try:
+        return await consent_service.get_contract_funding_payload(
+            db=db,
+            deal_id=deal_id,
+            caller=current_user,
+        )
+    except consent_service.ConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except consent_service.NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except consent_service.ConflictError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except PermissionError as exc:

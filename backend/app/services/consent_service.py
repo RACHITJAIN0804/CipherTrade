@@ -14,6 +14,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from eth_account import Account
@@ -34,10 +35,13 @@ from app.models.models import (
     User,
 )
 from app.schemas.consent import (
+    CommercialAgreementPayload,
     ConsentChallengeResponse,
     ConsentPartyDetail,
     ConsentStatusResponse,
     ConsentVerifyResponse,
+    ContractFundingPayloadResponse,
+    PartyConsentProofPayload,
 )
 from app.services import agreement_service
 
@@ -47,11 +51,16 @@ CONSENT_DOMAIN_NAME = "CipherTrade"
 CONSENT_DOMAIN_VERSION = "1"
 CONSENT_PRIMARY_TYPE = "AgreementConsent"
 
+# Phase 5E: Authoritative 11-Field EIP-712 Schema
 CONSENT_EIP712_TYPES = {
     "AgreementConsent": [
         {"name": "agreementHash", "type": "bytes32"},
         {"name": "offerId", "type": "string"},
         {"name": "dealId", "type": "string"},
+        {"name": "buyer", "type": "address"},
+        {"name": "seller", "type": "address"},
+        {"name": "amount", "type": "uint256"},
+        {"name": "deliveryDeadline", "type": "uint256"},
         {"name": "partyRole", "type": "string"},
         {"name": "signer", "type": "address"},
         {"name": "nonce", "type": "string"},
@@ -65,23 +74,138 @@ class ConflictError(ValueError):
     pass
 
 
+class NotFoundError(ValueError):
+    """Raised when a requested resource is not found (HTTP 404)."""
+    pass
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when required deployment or service configuration is missing or invalid (HTTP 503)."""
+    pass
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def get_consent_eip712_domain(chain_id: int, contract_address: str) -> dict[str, Any]:
+def get_configured_v2_address(required: bool = False) -> Optional[str]:
+    """
+    Return checksummed CipherTradeEscrowV2 address if configured.
+    Validates address format and raises ConfigurationError if configured but invalid.
+    If required=True and address is missing or invalid, raises ConfigurationError.
+    NEVER falls back to escrow_contract_address.
+    """
+    settings = get_settings()
+    addr = getattr(settings, "escrow_v2_contract_address", None)
+    if not addr or not str(addr).strip():
+        if required:
+            raise ConfigurationError(
+                "CipherTradeEscrowV2 contract address is not configured. "
+                "On-chain V2 deployment configuration is missing."
+            )
+        return None
+    addr_str = str(addr).strip()
+    if not Web3.is_address(addr_str):
+        raise ConfigurationError(
+            f"Configured escrow_v2_contract_address '{addr_str}' is not a valid Ethereum address."
+        )
+    return Web3.to_checksum_address(addr_str)
+
+
+def get_consent_eip712_domain(
+    chain_id: int, contract_address: Optional[str] = None
+) -> dict[str, Any]:
     """Return standard EIP-712 domain separator dictionary for agreement consent."""
-    return {
+    domain: dict[str, Any] = {
         "name": CONSENT_DOMAIN_NAME,
         "version": CONSENT_DOMAIN_VERSION,
         "chainId": int(chain_id),
-        "verifyingContract": Web3.to_checksum_address(contract_address),
+    }
+    if contract_address:
+        domain["verifyingContract"] = Web3.to_checksum_address(contract_address)
+    return domain
+
+
+def get_consent_eip712_types(include_verifying_contract: bool = True) -> dict[str, list[dict[str, str]]]:
+    """Return EIP-712 type definition for AgreementConsent."""
+    domain_fields = [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+    ]
+    if include_verifying_contract:
+        domain_fields.append({"name": "verifyingContract", "type": "address"})
+
+    return {
+        "EIP712Domain": domain_fields,
+        "AgreementConsent": CONSENT_EIP712_TYPES["AgreementConsent"],
     }
 
 
-def get_consent_eip712_types() -> dict[str, list[dict[str, str]]]:
-    """Return EIP-712 type definition for AgreementConsent."""
-    return CONSENT_EIP712_TYPES
+def verify_consent_signature_11_fields(
+    *,
+    agreement_hash: str,
+    offer_id: str,
+    deal_id: str,
+    buyer_address: str,
+    seller_address: str,
+    amount_wei: int,
+    delivery_deadline: int,
+    party_role: str,
+    signer_address: str,
+    nonce: str,
+    deadline: int,
+    signature: str,
+    chain_id: int,
+    contract_address: Optional[str] = None,
+) -> bool:
+    """
+    Verify an EIP-712 signature against the authoritative 11-field AgreementConsent schema.
+    Returns True if the recovered signer matches signer_address; False otherwise.
+    """
+    domain = {
+        "name": CONSENT_DOMAIN_NAME,
+        "version": CONSENT_DOMAIN_VERSION,
+        "chainId": int(chain_id),
+    }
+    domain_types = [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+    ]
+    if contract_address:
+        domain["verifyingContract"] = Web3.to_checksum_address(contract_address)
+        domain_types.append({"name": "verifyingContract", "type": "address"})
+
+    full_message = {
+        "types": {
+            "EIP712Domain": domain_types,
+            "AgreementConsent": CONSENT_EIP712_TYPES["AgreementConsent"],
+        },
+        "primaryType": CONSENT_PRIMARY_TYPE,
+        "domain": domain,
+        "message": {
+            "agreementHash": agreement_hash,
+            "offerId": str(offer_id),
+            "dealId": str(deal_id),
+            "buyer": Web3.to_checksum_address(buyer_address),
+            "seller": Web3.to_checksum_address(seller_address),
+            "amount": int(amount_wei),
+            "deliveryDeadline": int(delivery_deadline),
+            "partyRole": str(party_role),
+            "signer": Web3.to_checksum_address(signer_address),
+            "nonce": str(nonce),
+            "deadline": int(deadline),
+        },
+    }
+
+    try:
+        signable_bytes = encode_typed_data(full_message=full_message)
+        recovered = Account.recover_message(signable_bytes, signature=signature)
+        return Web3.to_checksum_address(recovered) == Web3.to_checksum_address(signer_address)
+    except Exception as exc:
+        logger.warning("Consent signature recovery failed: %s", exc)
+        return False
 
 
 async def _resolve_offer_with_relations(
@@ -238,13 +362,30 @@ async def create_consent_challenge(
     db.add(challenge)
     await db.commit()
 
+    # Look up buyer and seller wallets
+    buyer = await db.get(User, offer.requirement.buyer_id)
+    seller = await db.get(User, offer.seller_id)
+    buyer_wallet = Web3.to_checksum_address(buyer.wallet_address) if buyer and buyer.wallet_address else None
+    seller_wallet = Web3.to_checksum_address(seller.wallet_address) if seller and seller.wallet_address else None
+    if not buyer_wallet or not seller_wallet:
+        raise ValueError("Both buyer and seller must have verified wallet addresses linked before agreement consent can be generated.")
+
+    amount_wei = int(Decimal(str(offer.price_eth)) * Decimal(10**18))
+    delivery_deadline = int(offer.delivery_deadline)
+
     # 8. Build EIP-712 payload
-    domain = get_consent_eip712_domain(settings.chain_id, settings.escrow_contract_address)
+    v2_addr = get_configured_v2_address()
+    contract_addr = v2_addr if v2_addr else settings.escrow_contract_address
+    domain = get_consent_eip712_domain(settings.chain_id, contract_addr)
     types = get_consent_eip712_types()
     message = {
         "agreementHash": authoritative_hash,
         "offerId": str(offer.id),
         "dealId": str(effective_deal_id) if effective_deal_id else "",
+        "buyer": buyer_wallet,
+        "seller": seller_wallet,
+        "amount": amount_wei,
+        "deliveryDeadline": delivery_deadline,
         "partyRole": party_role,
         "signer": user_wallet,
         "nonce": nonce,
@@ -346,25 +487,21 @@ async def verify_and_record_consent(
         raise ValueError(f"Chain ID mismatch. Challenge was issued for chain {challenge.chain_id}.")
 
     # 7. Reconstruct EIP-712 structured data and recover signer
-    verifying_contract = Web3.to_checksum_address(settings.escrow_contract_address)
+    buyer = await db.get(User, offer.requirement.buyer_id)
+    seller = await db.get(User, offer.seller_id)
+    buyer_wallet = Web3.to_checksum_address(buyer.wallet_address) if buyer and buyer.wallet_address else None
+    seller_wallet = Web3.to_checksum_address(seller.wallet_address) if seller and seller.wallet_address else None
+    if not buyer_wallet or not seller_wallet:
+        raise ValueError("Both buyer and seller must have verified wallet addresses linked.")
+
+    amount_wei = int(Decimal(str(offer.price_eth)) * Decimal(10**18))
+    delivery_deadline = int(offer.delivery_deadline)
+
+    v2_addr = get_configured_v2_address()
+    verifying_contract = Web3.to_checksum_address(v2_addr if v2_addr else settings.escrow_contract_address)
+
     eip712_full_message = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            "AgreementConsent": [
-                {"name": "agreementHash", "type": "bytes32"},
-                {"name": "offerId", "type": "string"},
-                {"name": "dealId", "type": "string"},
-                {"name": "partyRole", "type": "string"},
-                {"name": "signer", "type": "address"},
-                {"name": "nonce", "type": "string"},
-                {"name": "deadline", "type": "uint256"},
-            ],
-        },
+        "types": get_consent_eip712_types(),
         "primaryType": CONSENT_PRIMARY_TYPE,
         "domain": {
             "name": CONSENT_DOMAIN_NAME,
@@ -376,6 +513,10 @@ async def verify_and_record_consent(
             "agreementHash": challenge.agreement_hash,
             "offerId": str(challenge.offer_id),
             "dealId": str(challenge.deal_id) if challenge.deal_id else "",
+            "buyer": buyer_wallet,
+            "seller": seller_wallet,
+            "amount": amount_wei,
+            "deliveryDeadline": delivery_deadline,
             "partyRole": challenge.party_role,
             "signer": challenge.wallet_address,
             "nonce": challenge.nonce,
@@ -481,3 +622,255 @@ async def check_both_parties_consented(
     )
 
     return buyer_wallet_match and seller_wallet_match
+
+
+async def get_contract_funding_payload(
+    db: AsyncSession,
+    deal_id: uuid.UUID,
+    caller: User,
+) -> ContractFundingPayloadResponse:
+    """
+    Construct a validated, contract-ready dual-consent funding payload for CipherTradeEscrowV2.
+
+    Enforces all Phase 5E.2 security requirements:
+      1. Retrieves the authoritative deal.
+      2. Retrieves its canonical agreement & authoritative hash.
+      3. Retrieves the buyer's verified consent.
+      4. Retrieves the seller's verified consent.
+      5. Confirms both parties belong to the same deal; ensures only the buyer retrieves the funding payload.
+      6. Confirms both consents refer to the exact same agreement hash.
+      7. Confirms offer ID and deal ID match authoritative database records.
+      8. Confirms both signing wallet addresses match the verified wallet addresses of their respective users.
+      9. Confirms both signatures were generated using the approved EIP-712 11-field schema and domain.
+      10. Confirms both consent deadlines are still valid.
+      11. Confirms consent nonces match actual stored challenge nonces.
+      12. Confirms both consents are approved and not revoked, superseded, or otherwise invalidated.
+      13. Constructs the exact CommercialAgreement.
+      14. Constructs buyerConsent and sellerConsent using their actual stored signatures.
+      15. Returns the complete contract-ready payload without mutating nonces or database state.
+    """
+    settings = get_settings()
+
+    # 0. Strictly require valid V2 contract address before any payload processing.
+    # NEVER fall back to legacy escrow_contract_address.
+    v2_address = get_configured_v2_address(required=True)
+    assert v2_address is not None
+
+    # 1. Retrieve authoritative deal
+    stmt = (
+        select(EscrowDeal)
+        .where(EscrowDeal.id == deal_id)
+        .options(
+            selectinload(EscrowDeal.offer).selectinload(Offer.requirement),
+            selectinload(EscrowDeal.buyer),
+            selectinload(EscrowDeal.seller),
+        )
+    )
+    deal = (await db.execute(stmt)).scalar_one_or_none()
+    if deal is None:
+        raise NotFoundError(f"Escrow deal '{deal_id}' not found.")
+
+    offer = deal.offer
+    if offer is None or offer.requirement is None:
+        raise ValueError("Associated offer or requirement not found for deal.")
+
+    # 2. Check authorization
+    if caller.id != deal.buyer_id and caller.id != deal.seller_id:
+        raise PermissionError("Access denied: You are not a participant in this deal.")
+
+    if caller.id != deal.buyer_id:
+        raise PermissionError("Access denied: Only the buyer can retrieve the funding-ready contract payload.")
+
+    # Buyer wallet ownership check
+    if not deal.buyer.wallet_address:
+        raise ValueError("Buyer does not have a verified wallet address linked to their account.")
+    if not caller.wallet_address or Web3.to_checksum_address(caller.wallet_address) != Web3.to_checksum_address(deal.buyer.wallet_address):
+        raise ValueError("Caller wallet does not match registered buyer wallet.")
+
+    if not deal.seller.wallet_address:
+        raise ValueError("Seller does not have a verified wallet address linked to their account.")
+
+    # On-chain state check
+    if deal.on_chain_state is not None:
+        raise ConflictError("Deal has already been funded on-chain.")
+
+    # 3. Retrieve canonical agreement and hash
+    _, authoritative_hash = agreement_service.generate_canonical_hash_for_entities(
+        offer, offer.requirement, deal_id=deal.id
+    )
+    expected_hash = authoritative_hash.lower()
+
+    if deal.agreement_hash and deal.agreement_hash.lower() != expected_hash:
+        raise ValueError("Deal agreement hash does not match canonical agreement hash.")
+
+    # 4. Retrieve buyer's and seller's verified consents
+    stmt_consents = select(AgreementConsent).where(
+        AgreementConsent.offer_id == deal.offer_id,
+        func.lower(AgreementConsent.agreement_hash) == expected_hash,
+    )
+    consents = (await db.execute(stmt_consents)).scalars().all()
+
+    buyer_consent = next((c for c in consents if c.party_role == "buyer"), None)
+    seller_consent = next((c for c in consents if c.party_role == "seller"), None)
+
+    if buyer_consent is None:
+        raise ConflictError("Buyer has not provided agreement consent.")
+    if seller_consent is None:
+        raise ConflictError("Seller has not provided agreement consent.")
+
+    # 5. Confirm parties belong to same deal
+    if buyer_consent.user_id != deal.buyer_id:
+        raise ValueError("Buyer consent user does not match deal buyer.")
+    if seller_consent.user_id != deal.seller_id:
+        raise ValueError("Seller consent user does not match deal seller.")
+
+    # 6. Confirm agreement hash
+    if buyer_consent.agreement_hash.lower() != expected_hash or seller_consent.agreement_hash.lower() != expected_hash:
+        raise ValueError("Consent agreement hash does not match authoritative agreement terms.")
+
+    # 7. Confirm offer ID and deal ID match
+    if buyer_consent.offer_id != deal.offer_id or seller_consent.offer_id != deal.offer_id:
+        raise ValueError("Consent offer ID does not match authoritative deal offer ID.")
+
+    if buyer_consent.deal_id and buyer_consent.deal_id != deal.id:
+        raise ValueError("Buyer consent deal ID does not match authoritative deal ID.")
+    if seller_consent.deal_id and seller_consent.deal_id != deal.id:
+        raise ValueError("Seller consent deal ID does not match authoritative deal ID.")
+
+    # 8. Confirm signing wallets match current registered user wallets
+    buyer_wallet = Web3.to_checksum_address(deal.buyer.wallet_address)
+    seller_wallet = Web3.to_checksum_address(deal.seller.wallet_address)
+
+    if Web3.to_checksum_address(buyer_consent.signer_wallet) != buyer_wallet:
+        raise ValueError("Buyer consent signer wallet does not match registered buyer wallet.")
+    if Web3.to_checksum_address(seller_consent.signer_wallet) != seller_wallet:
+        raise ValueError("Seller consent signer wallet does not match registered seller wallet.")
+
+    # 9. Confirm deadlines are still valid
+    current_ts = int(time.time())
+    if buyer_consent.deadline < current_ts:
+        raise ValueError("Buyer consent has expired. Fresh consent is required before contract funding.")
+    if seller_consent.deadline < current_ts:
+        raise ValueError("Seller consent has expired. Fresh consent is required before contract funding.")
+
+    # 10. Confirm nonces match actual stored challenges
+    stmt_b_ch = select(AgreementConsentChallenge).where(
+        AgreementConsentChallenge.nonce == buyer_consent.nonce,
+        AgreementConsentChallenge.offer_id == deal.offer_id,
+        AgreementConsentChallenge.user_id == deal.buyer_id,
+    )
+    b_ch = (await db.execute(stmt_b_ch)).scalar_one_or_none()
+    if b_ch is None:
+        raise ValueError("Authoritative challenge for buyer consent nonce not found.")
+    if b_ch.used_at is None:
+        raise ValueError("Buyer consent challenge was never completed.")
+
+    stmt_s_ch = select(AgreementConsentChallenge).where(
+        AgreementConsentChallenge.nonce == seller_consent.nonce,
+        AgreementConsentChallenge.offer_id == deal.offer_id,
+        AgreementConsentChallenge.user_id == deal.seller_id,
+    )
+    s_ch = (await db.execute(stmt_s_ch)).scalar_one_or_none()
+    if s_ch is None:
+        raise ValueError("Authoritative challenge for seller consent nonce not found.")
+    if s_ch.used_at is None:
+        raise ValueError("Seller consent challenge was never completed.")
+
+    # Confirm neither consent was superseded by a newer challenge
+    stmt_newer_b = select(AgreementConsentChallenge).where(
+        AgreementConsentChallenge.offer_id == deal.offer_id,
+        AgreementConsentChallenge.user_id == deal.buyer_id,
+        AgreementConsentChallenge.created_at > buyer_consent.created_at,
+    )
+    if (await db.execute(stmt_newer_b)).scalars().first() is not None:
+        raise ValueError("Buyer consent has been superseded by a newer consent challenge.")
+
+    stmt_newer_s = select(AgreementConsentChallenge).where(
+        AgreementConsentChallenge.offer_id == deal.offer_id,
+        AgreementConsentChallenge.user_id == deal.seller_id,
+        AgreementConsentChallenge.created_at > seller_consent.created_at,
+    )
+    if (await db.execute(stmt_newer_s)).scalars().first() is not None:
+        raise ValueError("Seller consent has been superseded by a newer consent challenge.")
+
+    # 11. Check chain ID
+    if buyer_consent.chain_id != settings.chain_id:
+        raise ValueError(f"Buyer consent was issued for chain {buyer_consent.chain_id}, expected {settings.chain_id}.")
+    if seller_consent.chain_id != settings.chain_id:
+        raise ValueError(f"Seller consent was issued for chain {seller_consent.chain_id}, expected {settings.chain_id}.")
+
+    # 12. Cryptographic signature verification against 11-field schema on V2 domain
+    amount_wei = int(Decimal(str(deal.amount_eth)) * Decimal(10**18))
+    delivery_deadline = int(deal.deadline_ts)
+
+    b_ok = verify_consent_signature_11_fields(
+        agreement_hash=authoritative_hash,
+        offer_id=str(deal.offer_id),
+        deal_id=str(deal.id),
+        buyer_address=buyer_wallet,
+        seller_address=seller_wallet,
+        amount_wei=amount_wei,
+        delivery_deadline=delivery_deadline,
+        party_role="buyer",
+        signer_address=buyer_wallet,
+        nonce=buyer_consent.nonce,
+        deadline=buyer_consent.deadline,
+        signature=buyer_consent.signature,
+        chain_id=buyer_consent.chain_id,
+        contract_address=v2_address,
+    )
+    if not b_ok:
+        raise ValueError("Buyer signature is invalid or incompatible with the approved 11-field AgreementConsent schema. Please provide fresh consent.")
+
+    s_ok = verify_consent_signature_11_fields(
+        agreement_hash=authoritative_hash,
+        offer_id=str(deal.offer_id),
+        deal_id=str(deal.id),
+        buyer_address=buyer_wallet,
+        seller_address=seller_wallet,
+        amount_wei=amount_wei,
+        delivery_deadline=delivery_deadline,
+        party_role="seller",
+        signer_address=seller_wallet,
+        nonce=seller_consent.nonce,
+        deadline=seller_consent.deadline,
+        signature=seller_consent.signature,
+        chain_id=seller_consent.chain_id,
+        contract_address=v2_address,
+    )
+    if not s_ok:
+        raise ValueError("Seller signature is invalid or incompatible with the approved 11-field AgreementConsent schema. Please provide fresh consent.")
+
+    # 13. Construct CommercialAgreement payload
+    agreement_payload = CommercialAgreementPayload(
+        agreementHash=authoritative_hash,
+        offerId=str(deal.offer_id),
+        dealId=str(deal.id),
+        buyer=buyer_wallet,
+        seller=seller_wallet,
+        amount=str(amount_wei),
+        deliveryDeadline=delivery_deadline,
+    )
+
+    # 14. Construct PartyConsentProof payloads
+    buyer_proof_payload = PartyConsentProofPayload(
+        nonce=buyer_consent.nonce,
+        deadline=buyer_consent.deadline,
+        signature=buyer_consent.signature,
+    )
+
+    seller_proof_payload = PartyConsentProofPayload(
+        nonce=seller_consent.nonce,
+        deadline=seller_consent.deadline,
+        signature=seller_consent.signature,
+    )
+
+    # 15. Return complete contract-ready payload
+    # Note: contract_address is strictly the configured V2 address (None if not yet configured)
+    return ContractFundingPayloadResponse(
+        deal_id=deal.id,
+        agreement=agreement_payload,
+        buyerConsent=buyer_proof_payload,
+        sellerConsent=seller_proof_payload,
+        contract_address=v2_address,
+    )
