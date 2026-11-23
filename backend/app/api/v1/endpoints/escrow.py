@@ -137,6 +137,8 @@ def format_escrow_transaction(deal: EscrowDeal) -> EscrowTransactionRead:
         deadline_ts=deal.deadline_ts,
         agreement_hash=deal.agreement_hash,
         on_chain_state=deal.on_chain_state,
+        contract_address=deal.contract_address,
+        contract_version=deal.contract_version,
         created_at=deal.created_at,
         updated_at=deal.updated_at,
         requirement_title=req_title,
@@ -244,103 +246,19 @@ async def sync_deal_state(
     db: AsyncSession = Depends(get_db),
 ) -> EscrowTransactionRead:
     """Read the latest on-chain state from getDeal() and update cached on_chain_state."""
-    stmt = (
-        select(EscrowDeal)
-        .where(EscrowDeal.id == deal_id)
-        .options(
-            selectinload(EscrowDeal.offer).selectinload(Offer.requirement),
-            selectinload(EscrowDeal.buyer),
-            selectinload(EscrowDeal.seller),
-        )
-    )
-    deal = (await db.execute(stmt)).scalar_one_or_none()
-    if deal is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found.")
-    if deal.buyer_id != current_user.id and deal.seller_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
-
-    if deal.chain_deal_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Deal is not linked to an on-chain deal ID.",
-        )
-
-    settings = get_settings()
-    if not settings.escrow_contract_address:
-        return format_escrow_transaction(deal)
-
     try:
-        w3 = get_web3()
-        if not w3.is_connected() or w3.eth.chain_id != settings.chain_id:
-            logger.warning("Blockchain node not reachable or chain ID mismatch in sync_deal_state.")
-            return format_escrow_transaction(deal)
-
-        contract = get_escrow_contract(w3)
-        if not contract:
-            return format_escrow_transaction(deal)
-
-        on_chain_raw = contract.functions.getDeal(deal.chain_deal_id).call()
-        # Struct: (buyer, seller, amount, deadline, agreementHash, state, fundsWithdrawn)
-        (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_state, oc_withdrawn) = on_chain_raw
-
-        # 1. Validate on-chain buyer against database record if buyer wallet is registered
-        if deal.buyer and deal.buyer.wallet_address:
-            if Web3.to_checksum_address(oc_buyer) != Web3.to_checksum_address(deal.buyer.wallet_address):
-                logger.error(
-                    "Sync abort: on-chain buyer %s does not match DB buyer %s",
-                    oc_buyer, deal.buyer.wallet_address
-                )
-                return format_escrow_transaction(deal)
-
-        # 2. Validate on-chain seller against database record if seller wallet is registered
-        if deal.seller and deal.seller.wallet_address:
-            if Web3.to_checksum_address(oc_seller) != Web3.to_checksum_address(deal.seller.wallet_address):
-                logger.error(
-                    "Sync abort: on-chain seller %s does not match DB seller %s",
-                    oc_seller, deal.seller.wallet_address
-                )
-                return format_escrow_transaction(deal)
-
-        # 3. Validate on-chain amount against deal amount
-        expected_wei = int(Decimal(str(deal.amount_eth)) * Decimal("10") ** 18)
-        if int(oc_amount) != expected_wei:
-            logger.error("Sync abort: on-chain amount %s != expected wei %s", oc_amount, expected_wei)
-            return format_escrow_transaction(deal)
-
-        # 4. Validate agreement hash if present
-        if deal.agreement_hash:
-            raw_ag_hash = ("0x" + oc_ag_hash.hex()) if isinstance(oc_ag_hash, (bytes, bytearray)) else str(oc_ag_hash)
-            expected_hash = deal.agreement_hash.lower()
-            if not expected_hash.startswith("0x"):
-                expected_hash = "0x" + expected_hash
-            if raw_ag_hash.lower() != expected_hash:
-                logger.error("Sync abort: on-chain agreement hash %s != expected %s", raw_ag_hash, expected_hash)
-                return format_escrow_transaction(deal)
-
-        # 5. Map Solidity integer state to EscrowState enum
-        if oc_state in STATE_INT_TO_ENUM:
-            new_state = STATE_INT_TO_ENUM[oc_state]
-
-            # 6. Terminal state protection: terminal states cannot be downgraded
-            TERMINAL_STATES = {
-                EscrowState.RELEASED,
-                EscrowState.REFUNDED,
-                EscrowState.CANCELLED,
-                EscrowState.RESOLVED,
-            }
-            if deal.on_chain_state in TERMINAL_STATES and new_state not in TERMINAL_STATES:
-                logger.warning(
-                    "Sync rejected: attempt to overwrite terminal state %s with %s for deal %s",
-                    deal.on_chain_state, new_state, deal.id
-                )
-                return format_escrow_transaction(deal)
-
-            if deal.on_chain_state != new_state:
-                deal.on_chain_state = new_state
-                await db.commit()
-                await db.refresh(deal)
-    except Exception as exc:
-        logger.warning("Blockchain sync query failed for deal %s: %s", deal.id, exc)
+        deal = await escrow_service.sync_deal_state(
+            db=db,
+            deal_id=deal_id,
+            caller=current_user,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
 
     return format_escrow_transaction(deal)
 

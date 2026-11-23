@@ -296,6 +296,8 @@ async def test_v2_dual_consent_end_to_end(client: AsyncClient):
     assert verified_deal["chain_deal_id"] == chain_deal_id
     assert verified_deal["fund_tx_hash"].lower() == tx_hash_hex.lower()
     assert verified_deal["on_chain_state"] == "FUNDED"
+    assert verified_deal["contract_address"].lower() == v2_contract.address.lower()
+    assert verified_deal["contract_version"] == "v2"
 
     # 10. Query deal state via GET
     get_deal_resp = await client.get(
@@ -306,3 +308,67 @@ async def test_v2_dual_consent_end_to_end(client: AsyncClient):
     deal_record = get_deal_resp.json()
     assert deal_record["chain_deal_id"] == chain_deal_id
     assert deal_record["on_chain_state"] == "FUNDED"
+    assert deal_record["contract_address"].lower() == v2_contract.address.lower()
+    assert deal_record["contract_version"] == "v2"
+
+    # 11. Test V2 State Synchronization while in FUNDED state
+    sync_resp_funded = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/sync",
+        headers={"Authorization": f"Bearer {b_token}"},
+    )
+    assert sync_resp_funded.status_code == 200
+    synced_data = sync_resp_funded.json()
+    assert synced_data["on_chain_state"] == "FUNDED"
+    assert synced_data["contract_address"].lower() == v2_contract.address.lower()
+    assert synced_data["contract_version"] == "v2"
+
+    # 12. Buyer executes on-chain confirmDelivery(chain_deal_id) on CipherTradeEscrowV2
+    confirm_tx_dict = v2_contract.functions.confirmDelivery(chain_deal_id).build_transaction({
+        "from": buyer_addr,
+        "nonce": w3.eth.get_transaction_count(buyer_addr),
+        "gas": 200000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId": 31337,
+    })
+    signed_confirm = w3.eth.account.sign_transaction(confirm_tx_dict, buyer_info["pk"])
+    confirm_tx_hash = w3.eth.send_raw_transaction(signed_confirm.raw_transaction)
+    confirm_receipt = w3.eth.wait_for_transaction_receipt(confirm_tx_hash, timeout=10)
+    assert confirm_receipt["status"] == 1
+
+    # 13. Sync deal state to backend -> state must become CONFIRMED
+    sync_resp_conf = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/sync",
+        headers={"Authorization": f"Bearer {b_token}"},
+    )
+    assert sync_resp_conf.status_code == 200
+    assert sync_resp_conf.json()["on_chain_state"] == "CONFIRMED"
+
+    # 14. Seller executes on-chain withdrawPayment(chain_deal_id) on CipherTradeEscrowV2
+    seller_addr = Web3.to_checksum_address(seller_info["address"])
+    withdraw_tx_dict = v2_contract.functions.withdrawPayment(chain_deal_id).build_transaction({
+        "from": seller_addr,
+        "nonce": w3.eth.get_transaction_count(seller_addr),
+        "gas": 200000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId": 31337,
+    })
+    signed_withdraw = w3.eth.account.sign_transaction(withdraw_tx_dict, seller_info["pk"])
+    withdraw_tx_hash = w3.eth.send_raw_transaction(signed_withdraw.raw_transaction)
+    withdraw_receipt = w3.eth.wait_for_transaction_receipt(withdraw_tx_hash, timeout=10)
+    assert withdraw_receipt["status"] == 1
+
+    # 15. Sync deal state to backend -> state must become RELEASED (terminal)
+    sync_resp_rel = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/sync",
+        headers={"Authorization": f"Bearer {s_token}"},
+    )
+    assert sync_resp_rel.status_code == 200
+    assert sync_resp_rel.json()["on_chain_state"] == "RELEASED"
+
+    # 16. Terminal state cannot be downgraded on subsequent sync
+    sync_resp_repeat = await client.post(
+        f"/api/v1/escrow/deals/{deal_id}/sync",
+        headers={"Authorization": f"Bearer {b_token}"},
+    )
+    assert sync_resp_repeat.status_code == 200
+    assert sync_resp_repeat.json()["on_chain_state"] == "RELEASED"

@@ -236,9 +236,11 @@ async def verify_funding_transaction(
     if v2_address and tx_to_checksum == v2_address:
         is_v2 = True
         contract_address = v2_address
+        contract_version = "v2"
     elif v1_address and tx_to_checksum == v1_address:
         is_v2 = False
         contract_address = v1_address
+        contract_version = "v1"
     else:
         raise ValueError("Transaction destination does not match any configured escrow contract address.")
 
@@ -414,6 +416,8 @@ async def verify_funding_transaction(
     deal.chain_deal_id = chain_deal_id
     deal.fund_tx_hash = clean_tx_hash
     deal.on_chain_state = EscrowState.FUNDED
+    deal.contract_address = contract_address
+    deal.contract_version = contract_version
 
     try:
         await db.commit()
@@ -425,6 +429,202 @@ async def verify_funding_transaction(
         ) from exc
 
     logger.info("Successfully verified and marked deal %s as FUNDED (chain_deal_id=%s)", deal.id, chain_deal_id)
+    return deal
+
+
+STATE_INT_TO_ENUM: dict[int, EscrowState] = {
+    0: EscrowState.FUNDED,
+    1: EscrowState.CONFIRMED,
+    2: EscrowState.RELEASED,
+    3: EscrowState.REFUNDED,
+    4: EscrowState.CANCELLED,
+    5: EscrowState.DISPUTED,
+    6: EscrowState.RESOLVED,
+}
+
+TERMINAL_STATES = {
+    EscrowState.RELEASED,
+    EscrowState.REFUNDED,
+    EscrowState.CANCELLED,
+    EscrowState.RESOLVED,
+}
+
+
+async def sync_deal_state(
+    db: AsyncSession,
+    deal_id: uuid.UUID,
+    caller: User,
+) -> EscrowDeal:
+    """
+    Synchronize cached deal state with on-chain smart contract (V1 or V2).
+
+    Security and architectural rules enforced:
+      1. Deal must exist and caller must be authorized (buyer or seller).
+      2. Deal must be linked to an on-chain deal ID.
+      3. Contract identity is resolved from trusted persisted metadata.
+      4. For legacy records lacking contract metadata, inspects fund_tx_hash on-chain,
+         validates the destination against configured V1/V2 addresses, and persists it.
+      5. Strictly validates contract address and version: never silently falls back.
+      6. Selects get_escrow_contract for V1 (7-tuple) or get_escrow_v2_contract for V2 (8-tuple).
+      7. Validates on-chain dealUuidHash (for V2), buyer, seller, amount, and agreement hash.
+      8. Protects terminal states from being downgraded.
+    """
+    from sqlalchemy.orm import selectinload
+
+    stmt = (
+        select(EscrowDeal)
+        .where(EscrowDeal.id == deal_id)
+        .options(
+            selectinload(EscrowDeal.offer).selectinload(Offer.requirement),
+            selectinload(EscrowDeal.buyer),
+            selectinload(EscrowDeal.seller),
+        )
+    )
+    deal = (await db.execute(stmt)).scalar_one_or_none()
+    if deal is None:
+        raise ValueError("Deal not found.")
+
+    if deal.buyer_id != caller.id and deal.seller_id != caller.id:
+        raise PermissionError("Access denied.")
+
+    if deal.chain_deal_id is None:
+        raise ValueError("Deal is not linked to an on-chain deal ID.")
+
+    settings = get_settings()
+    w3 = get_web3()
+    if not w3.is_connected():
+        raise ValueError("Unable to connect to blockchain RPC node.")
+
+    try:
+        current_chain_id = w3.eth.chain_id
+    except Exception as exc:
+        raise ValueError(f"Failed to query chain ID from RPC: {exc}")
+
+    if current_chain_id != settings.chain_id:
+        raise ValueError(f"Chain ID mismatch. Expected {settings.chain_id}, got {current_chain_id}.")
+
+    v1_address = Web3.to_checksum_address(settings.escrow_contract_address) if settings.escrow_contract_address else None
+    v2_address = Web3.to_checksum_address(settings.escrow_v2_contract_address) if settings.escrow_v2_contract_address else None
+
+    contract_version = deal.contract_version
+    contract_address = Web3.to_checksum_address(deal.contract_address) if deal.contract_address else None
+
+    # Safe backward-compatibility resolution for legacy records without contract metadata
+    if not contract_version or not contract_address:
+        if deal.fund_tx_hash:
+            try:
+                tx = w3.eth.get_transaction(deal.fund_tx_hash)
+            except Exception as exc:
+                raise ValueError(f"Failed to query historical funding transaction: {exc}")
+            if not tx:
+                raise ValueError("Historical funding transaction not found on chain.")
+            tx_to = tx.get("to") if isinstance(tx, dict) or hasattr(tx, "get") else getattr(tx, "to", None)
+            if not tx_to:
+                raise ValueError("Historical transaction has no destination address.")
+            tx_to_checksum = Web3.to_checksum_address(tx_to)
+            if v2_address and tx_to_checksum == v2_address:
+                contract_version = "v2"
+                contract_address = v2_address
+            elif v1_address and tx_to_checksum == v1_address:
+                contract_version = "v1"
+                contract_address = v1_address
+            else:
+                raise ValueError(
+                    f"Historical transaction destination ({tx_to_checksum}) does not match any configured contract address."
+                )
+            deal.contract_address = contract_address
+            deal.contract_version = contract_version
+            await db.commit()
+            await db.refresh(deal)
+        else:
+            raise ValueError("Deal has missing contract metadata and no fund_tx_hash for resolution.")
+
+    # Strict contract identity validation
+    if contract_version == "v2":
+        if not v2_address:
+            raise ValueError("V2 escrow contract is not configured in backend settings.")
+        if contract_address != v2_address:
+            raise ValueError(f"Persisted contract address ({contract_address}) does not match configured V2 address ({v2_address}).")
+        contract = get_escrow_v2_contract(w3)
+        if contract is None:
+            raise ValueError("V2 escrow contract could not be loaded or ABI artifact is missing.")
+    elif contract_version == "v1":
+        if not v1_address:
+            raise ValueError("V1 escrow contract is not configured in backend settings.")
+        if contract_address != v1_address:
+            raise ValueError(f"Persisted contract address ({contract_address}) does not match configured V1 address ({v1_address}).")
+        contract = get_escrow_contract(w3)
+        if contract is None:
+            raise ValueError("V1 escrow contract could not be loaded or ABI artifact is missing.")
+    else:
+        raise ValueError(f"Unsupported contract version '{contract_version}'.")
+
+    # Read on-chain deal state
+    try:
+        on_chain_raw = contract.functions.getDeal(deal.chain_deal_id).call()
+    except Exception as exc:
+        raise ValueError(f"Failed to read deal from contract getDeal(): {exc}")
+
+    if contract_version == "v2":
+        # V2 Deal struct: (buyer, seller, amount, deadline, agreementHash, dealUuidHash, state, fundsWithdrawn)
+        if len(on_chain_raw) != 8:
+            raise ValueError(f"Expected 8-field tuple for V2 getDeal(), got {len(on_chain_raw)} fields.")
+        (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_uuid_hash, oc_state, oc_withdrawn) = on_chain_raw
+        expected_uuid_hash = Web3.keccak(text=str(deal.id))
+        if isinstance(oc_uuid_hash, (bytes, bytearray)):
+            if oc_uuid_hash != expected_uuid_hash:
+                raise ValueError("On-chain deal UUID hash does not match.")
+        elif str(oc_uuid_hash).lower() != expected_uuid_hash.hex().lower():
+            raise ValueError("On-chain deal UUID hash does not match.")
+    else:
+        # V1 Deal struct: (buyer, seller, amount, deadline, agreementHash, state, fundsWithdrawn)
+        if len(on_chain_raw) != 7:
+            raise ValueError(f"Expected 7-field tuple for V1 getDeal(), got {len(on_chain_raw)} fields.")
+        (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_state, oc_withdrawn) = on_chain_raw
+
+    # 1. Validate on-chain buyer against database record if buyer wallet is registered
+    if deal.buyer and deal.buyer.wallet_address:
+        if Web3.to_checksum_address(oc_buyer) != Web3.to_checksum_address(deal.buyer.wallet_address):
+            raise ValueError(f"On-chain buyer ({oc_buyer}) does not match deal buyer ({deal.buyer.wallet_address}).")
+
+    # 2. Validate on-chain seller against database record if seller wallet is registered
+    if deal.seller and deal.seller.wallet_address:
+        if Web3.to_checksum_address(oc_seller) != Web3.to_checksum_address(deal.seller.wallet_address):
+            raise ValueError(f"On-chain seller ({oc_seller}) does not match deal seller ({deal.seller.wallet_address}).")
+
+    # 3. Validate on-chain amount against deal amount
+    expected_wei = int(Decimal(str(deal.amount_eth)) * Decimal(10**18))
+    if int(oc_amount) != expected_wei:
+        raise ValueError(f"On-chain amount ({oc_amount}) does not match expected wei ({expected_wei}).")
+
+    # 4. Validate agreement hash if present
+    if deal.agreement_hash:
+        raw_ag_hash = ("0x" + oc_ag_hash.hex()) if isinstance(oc_ag_hash, (bytes, bytearray)) else str(oc_ag_hash)
+        expected_hash = deal.agreement_hash.lower()
+        if not expected_hash.startswith("0x"):
+            expected_hash = "0x" + expected_hash
+        if raw_ag_hash.lower() != expected_hash:
+            raise ValueError(f"On-chain agreement hash ({raw_ag_hash}) does not match expected ({expected_hash}).")
+
+    # 5. Map Solidity integer state to EscrowState enum
+    if oc_state not in STATE_INT_TO_ENUM:
+        raise ValueError(f"Unknown on-chain state integer: {oc_state}")
+
+    new_state = STATE_INT_TO_ENUM[oc_state]
+
+    # 6. Terminal state protection: terminal states cannot be downgraded
+    if deal.on_chain_state in TERMINAL_STATES and new_state not in TERMINAL_STATES:
+        logger.warning(
+            "Sync rejected: attempt to overwrite terminal state %s with %s for deal %s",
+            deal.on_chain_state, new_state, deal.id
+        )
+        return deal
+
+    if deal.on_chain_state != new_state:
+        deal.on_chain_state = new_state
+        await db.commit()
+        await db.refresh(deal)
+
     return deal
 
 

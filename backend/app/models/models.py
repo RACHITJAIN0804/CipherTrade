@@ -267,6 +267,8 @@ class EscrowDeal(Base):
     # On-chain identifiers — set once the tx is verified
     chain_deal_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)
     fund_tx_hash: Mapped[str | None] = mapped_column(String(66), unique=True, nullable=True)
+    contract_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    contract_version: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # Amounts
     amount_eth: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)

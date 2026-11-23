@@ -15,6 +15,7 @@ import {
   ESCROW_V2_CONTRACT_ADDRESS,
   ESCROW_V2_ABI,
 } from '../config/contracts.ts';
+import type { DealContractIdentity, EscrowContractVersion } from '../types/index.ts';
 
 /**
  * On-chain lifecycle states defined in CipherTradeEscrow.sol and CipherTradeEscrowV2.sol:
@@ -660,17 +661,155 @@ export function formatContractError(err: unknown): string {
 }
 
 /**
+ * Resolved lifecycle contract information.
+ */
+export interface ResolvedLifecycleContract {
+  contract: Contract;
+  version: EscrowContractVersion;
+  address: string;
+}
+
+/**
+ * Resolve and validate the smart contract (V1 or V2) for an escrow lifecycle operation.
+ *
+ * Rules:
+ *  1. Missing contract identity is rejected.
+ *  2. Unsupported contract versions are rejected (only 'v1' and 'v2' allowed).
+ *  3. Malformed contract addresses are rejected.
+ *  4. V2 deals route through V2 ABI and must not point to V1 address.
+ *  5. V1 deals route through V1 ABI and must not point to V2 address.
+ *  6. V2 deals never fall back to V1 under any circumstances.
+ */
+export function resolveLifecycleContract(
+  runner: ContractRunner,
+  contractIdentity?: string | DealContractIdentity | null
+): ResolvedLifecycleContract {
+  if (!contractIdentity) {
+    throw new Error(
+      'Missing contract identity for escrow deal. Neither contract version nor contract address was provided.'
+    );
+  }
+
+  let rawVersion: string | null = null;
+  let rawAddress: string | null = null;
+
+  if (typeof contractIdentity === 'string') {
+    rawAddress = contractIdentity.trim();
+  } else if (typeof contractIdentity === 'object') {
+    if (contractIdentity.contract_version !== undefined && contractIdentity.contract_version !== null) {
+      rawVersion = String(contractIdentity.contract_version).trim();
+    }
+    if (contractIdentity.contract_address !== undefined && contractIdentity.contract_address !== null) {
+      rawAddress = String(contractIdentity.contract_address).trim();
+    }
+  } else {
+    throw new Error('Invalid contract identity specification: expected a contract address string or identity object.');
+  }
+
+  if (!rawVersion && !rawAddress) {
+    throw new Error(
+      'Missing contract identity for escrow deal. Neither contract version nor contract address was provided.'
+    );
+  }
+
+  // Validate version if provided
+  let normalizedVersion: EscrowContractVersion | null = null;
+  if (rawVersion) {
+    const vLower = rawVersion.toLowerCase();
+    if (vLower === 'v1' || vLower === 'v2') {
+      normalizedVersion = vLower;
+    } else {
+      throw new Error(`Unsupported contract version: "${rawVersion}". Only "v1" and "v2" are supported.`);
+    }
+  }
+
+  // Validate address if provided
+  let checksumAddress: string | null = null;
+  if (rawAddress) {
+    if (!isAddress(rawAddress)) {
+      throw new Error(`Malformed contract address: "${rawAddress}". Must be a valid 20-byte hex Ethereum address.`);
+    }
+    checksumAddress = getAddress(rawAddress);
+  }
+
+  const v1ConfigAddress = getAddress(ESCROW_CONTRACT_ADDRESS);
+  const v2ConfigAddress =
+    ESCROW_V2_CONTRACT_ADDRESS && isAddress(ESCROW_V2_CONTRACT_ADDRESS)
+      ? getAddress(ESCROW_V2_CONTRACT_ADDRESS)
+      : null;
+
+  if (normalizedVersion === 'v2') {
+    if (!checksumAddress) {
+      throw new Error('Missing contract address for V2 deal. V2 deals must specify a verified contract_address.');
+    }
+    if (checksumAddress.toLowerCase() === v1ConfigAddress.toLowerCase()) {
+      throw new Error(
+        `Contract identity mismatch: V2 deal cannot target the V1 contract address (${v1ConfigAddress}). Potential contract confusion detected.`
+      );
+    }
+    if (!v2ConfigAddress) {
+      throw new Error(
+        'CipherTradeEscrowV2 address is not configured in the frontend. ' +
+        'Set VITE_ESCROW_V2_CONTRACT_ADDRESS in your .env file after deployment.'
+      );
+    }
+    if (checksumAddress.toLowerCase() !== v2ConfigAddress.toLowerCase()) {
+      throw new Error(
+        `V2 contract address mismatch: deal contract address (${checksumAddress}) does not match configured V2 address (${v2ConfigAddress}).`
+      );
+    }
+    const contract = getEscrowV2Contract(runner, checksumAddress);
+    return { contract, version: 'v2', address: checksumAddress };
+  }
+
+  if (normalizedVersion === 'v1') {
+    if (checksumAddress) {
+      if (v2ConfigAddress && checksumAddress.toLowerCase() === v2ConfigAddress.toLowerCase()) {
+        throw new Error(
+          `Contract identity mismatch: V1 deal cannot target the V2 contract address (${checksumAddress}). Potential contract confusion detected.`
+        );
+      }
+      if (checksumAddress.toLowerCase() !== v1ConfigAddress.toLowerCase()) {
+        throw new Error(
+          `V1 contract address mismatch: deal contract address (${checksumAddress}) does not match configured V1 address (${v1ConfigAddress}).`
+        );
+      }
+    }
+    const targetAddress = checksumAddress ?? v1ConfigAddress;
+    const contract = getEscrowContract(runner, targetAddress);
+    return { contract, version: 'v1', address: targetAddress };
+  }
+
+  // Version omitted: deduce safely from checksumAddress
+  if (checksumAddress) {
+    if (checksumAddress.toLowerCase() === v1ConfigAddress.toLowerCase()) {
+      const contract = getEscrowContract(runner, checksumAddress);
+      return { contract, version: 'v1', address: checksumAddress };
+    }
+    if (v2ConfigAddress && checksumAddress.toLowerCase() === v2ConfigAddress.toLowerCase()) {
+      const contract = getEscrowV2Contract(runner, checksumAddress);
+      return { contract, version: 'v2', address: checksumAddress };
+    }
+    throw new Error(
+      `Unknown or unconfigured contract address: "${checksumAddress}". Does not match configured V1 (${v1ConfigAddress}) or V2 (${v2ConfigAddress || 'not configured'}).`
+    );
+  }
+
+  throw new Error('Missing contract identity for escrow deal. Neither contract version nor contract address was provided.');
+}
+
+/**
  * Buyer confirms delivery on-chain.
- * Compatible with both V1 and V2 (same function signature).
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
  */
 export async function confirmDeliveryOnChain(
   chainDealId: number,
   signer: JsonRpcSigner,
-  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+  contractIdentity?: string | DealContractIdentity
 ): Promise<string> {
   if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
   if (!signer) throw new Error('A connected wallet signer is required.');
-  const contract = getEscrowContract(signer, contractAddress);
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
   const tx = await contract.confirmDelivery(BigInt(chainDealId));
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
@@ -681,16 +820,16 @@ export async function confirmDeliveryOnChain(
 
 /**
  * Buyer cancels expired deal and reclaims escrowed funds.
- * Compatible with both V1 and V2 (same function signature).
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
  */
 export async function cancelExpiredOnChain(
   chainDealId: number,
   signer: JsonRpcSigner,
-  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+  contractIdentity?: string | DealContractIdentity
 ): Promise<string> {
   if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
   if (!signer) throw new Error('A connected wallet signer is required.');
-  const contract = getEscrowContract(signer, contractAddress);
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
   const tx = await contract.cancelExpired(BigInt(chainDealId));
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
@@ -701,16 +840,16 @@ export async function cancelExpiredOnChain(
 
 /**
  * Seller withdraws payment after buyer has confirmed delivery (pull payment pattern).
- * Compatible with both V1 and V2 (same function signature).
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
  */
 export async function withdrawPaymentOnChain(
   chainDealId: number,
   signer: JsonRpcSigner,
-  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+  contractIdentity?: string | DealContractIdentity
 ): Promise<string> {
   if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
   if (!signer) throw new Error('A connected wallet signer is required.');
-  const contract = getEscrowContract(signer, contractAddress);
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
   const tx = await contract.withdrawPayment(BigInt(chainDealId));
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
@@ -721,16 +860,16 @@ export async function withdrawPaymentOnChain(
 
 /**
  * Seller voluntarily refunds the buyer before delivery is confirmed.
- * Compatible with both V1 and V2 (same function signature).
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
  */
 export async function refundBuyerOnChain(
   chainDealId: number,
   signer: JsonRpcSigner,
-  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+  contractIdentity?: string | DealContractIdentity
 ): Promise<string> {
   if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
   if (!signer) throw new Error('A connected wallet signer is required.');
-  const contract = getEscrowContract(signer, contractAddress);
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
   const tx = await contract.refundBuyer(BigInt(chainDealId));
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
@@ -741,20 +880,41 @@ export async function refundBuyerOnChain(
 
 /**
  * Either party (buyer or seller) raises a dispute, freezing funds for arbitrator.
- * Compatible with both V1 and V2 (same function signature).
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
  */
 export async function raiseDisputeOnChain(
   chainDealId: number,
   signer: JsonRpcSigner,
-  contractAddress: string = ESCROW_CONTRACT_ADDRESS
+  contractIdentity?: string | DealContractIdentity
 ): Promise<string> {
   if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
   if (!signer) throw new Error('A connected wallet signer is required.');
-  const contract = getEscrowContract(signer, contractAddress);
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
   const tx = await contract.raiseDispute(BigInt(chainDealId));
   const receipt = await tx.wait(1);
   if (!receipt || receipt.status !== 1) {
     throw new Error('raiseDispute transaction failed or reverted on-chain.');
+  }
+  return receipt.hash;
+}
+
+/**
+ * Arbitrator resolves an open dispute.
+ * Routes to V1 (CipherTradeEscrow) or V2 (CipherTradeEscrowV2) based on contract identity.
+ */
+export async function resolveDisputeOnChain(
+  chainDealId: number,
+  toSeller: boolean,
+  signer: JsonRpcSigner,
+  contractIdentity?: string | DealContractIdentity
+): Promise<string> {
+  if (chainDealId < 0) throw new Error('Invalid chain deal ID.');
+  if (!signer) throw new Error('A connected wallet signer is required.');
+  const { contract } = resolveLifecycleContract(signer, contractIdentity);
+  const tx = await contract.resolveDispute(BigInt(chainDealId), toSeller);
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error('resolveDispute transaction failed or reverted on-chain.');
   }
   return receipt.hash;
 }

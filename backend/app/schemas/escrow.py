@@ -46,6 +46,8 @@ class EscrowDealRead(BaseModel):
     deadline_ts: int
     agreement_hash: Optional[str]
     on_chain_state: Optional[EscrowState]
+    contract_address: Optional[str] = None
+    contract_version: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

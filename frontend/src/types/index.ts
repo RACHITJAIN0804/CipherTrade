@@ -68,6 +68,13 @@ export interface Conversation {
   created_at: string;
 }
 
+export type EscrowContractVersion = 'v1' | 'v2';
+
+export interface DealContractIdentity {
+  contract_address?: string | null;
+  contract_version?: EscrowContractVersion | string | null;
+}
+
 export interface EscrowDeal {
   id: string;
   offer_id: string;
@@ -79,6 +86,8 @@ export interface EscrowDeal {
   deadline_ts: number;
   agreement_hash: string | null;
   on_chain_state: EscrowState | null;
+  contract_address?: string | null;
+  contract_version?: EscrowContractVersion | string | null;
   created_at: string;
   updated_at: string;
 }

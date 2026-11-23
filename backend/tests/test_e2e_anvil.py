@@ -241,6 +241,8 @@ async def test_e2e_complete_buyer_seller_happy_path(client: AsyncClient):
     verified_deal = verify_resp.json()
     assert verified_deal["on_chain_state"] == "FUNDED"
     assert verified_deal["fund_tx_hash"] == tx_hash
+    assert verified_deal["contract_address"].lower() == contract.address.lower()
+    assert verified_deal["contract_version"] == "v1"
     chain_deal_id = verified_deal["chain_deal_id"]
     assert chain_deal_id is not None
 

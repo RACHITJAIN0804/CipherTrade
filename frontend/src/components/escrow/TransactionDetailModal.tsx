@@ -113,7 +113,7 @@ export function TransactionDetailModal({
 
   const executeContractAction = async (
     actionName: string,
-    actionFn: (chainDealId: number, signerInstance: any) => Promise<string>,
+    actionFn: (chainDealId: number, signerInstance: any, contractIdentity?: any) => Promise<string>,
     successMsg: string
   ) => {
     if (!isConnected) {
@@ -156,7 +156,12 @@ export function TransactionDetailModal({
       setActionError(null);
       setActionSuccess(null);
 
-      const txHash = await actionFn(currentDeal.chain_deal_id, signer);
+      const contractIdentity = {
+        contract_address: currentDeal.contract_address,
+        contract_version: currentDeal.contract_version,
+      };
+
+      const txHash = await actionFn(currentDeal.chain_deal_id, signer, contractIdentity);
 
       // Automatically sync on-chain state to the backend database
       let updatedDeal: EscrowTransaction;
@@ -374,6 +379,30 @@ export function TransactionDetailModal({
                   className="text-slate-400 hover:text-white shrink-0"
                 >
                   {copiedKey === 'ag_hash' ? (
+                    <CheckCircle2 className="w-3 h-3 text-green-400" />
+                  ) : (
+                    <Copy className="w-3 h-3" />
+                  )}
+                </button>
+              </div>
+            )}
+            {currentDeal.contract_version && (
+              <div className="flex items-center justify-between text-slate-400 bg-slate-900/50 p-1.5 rounded">
+                <span className="text-slate-400">Contract Version:</span>
+                <span className="text-cyan-400 font-semibold">{currentDeal.contract_version.toUpperCase()}</span>
+              </div>
+            )}
+            {currentDeal.contract_address && (
+              <div className="flex items-center justify-between text-slate-400 bg-slate-900/50 p-1.5 rounded">
+                <span className="text-slate-400">Contract Address:</span>
+                <span className="text-slate-200 truncate mx-2">{formatAddress(currentDeal.contract_address)}</span>
+                <button
+                  type="button"
+                  onClick={() => copyToClipboard(currentDeal.contract_address!, 'contract_addr')}
+                  className="text-slate-400 hover:text-white shrink-0"
+                  title="Copy contract address"
+                >
+                  {copiedKey === 'contract_addr' ? (
                     <CheckCircle2 className="w-3 h-3 text-green-400" />
                   ) : (
                     <Copy className="w-3 h-3" />
