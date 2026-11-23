@@ -59,6 +59,7 @@ def resolve_abi_path(configured_path: Optional[str | Path] = None) -> Path:
     clean_name = path.name
     if clean_name:
         candidates.append(repo_root / "contracts" / "out" / "CipherTradeEscrow.sol" / clean_name)
+        candidates.append(repo_root / "contracts" / "out" / "CipherTradeEscrowV2.sol" / clean_name)
 
     for candidate in candidates:
         if candidate.exists():
@@ -66,6 +67,47 @@ def resolve_abi_path(configured_path: Optional[str | Path] = None) -> Path:
 
     # Fallback to original path if not found
     return path
+
+
+def load_v2_contract_abi() -> Optional[List[dict]]:
+    """Load CipherTradeEscrowV2 ABI from the compiled Foundry artifact."""
+    core_dir = Path(__file__).resolve().parent
+    backend_dir = core_dir.parent.parent
+    repo_root = backend_dir.parent
+    candidates = [
+        repo_root / "contracts" / "out" / "CipherTradeEscrowV2.sol" / "CipherTradeEscrowV2.json",
+        backend_dir / "contracts" / "out" / "CipherTradeEscrowV2.sol" / "CipherTradeEscrowV2.json",
+        Path("contracts/out/CipherTradeEscrowV2.sol/CipherTradeEscrowV2.json"),
+    ]
+    for c in candidates:
+        if c.exists():
+            try:
+                with c.open("r", encoding="utf-8") as f:
+                    artifact = json.load(f)
+                return artifact.get("abi")
+            except Exception as exc:
+                logger.error("Failed to parse V2 contract ABI from %s: %s", c, exc)
+                return None
+    return None
+
+
+def get_escrow_v2_contract(
+    w3: Optional[Web3] = None,
+    address: Optional[str] = None,
+    abi: Optional[List[dict]] = None,
+) -> Optional[Contract]:
+    """Return a web3.eth.contract instance for CipherTradeEscrowV2."""
+    settings = get_settings()
+    contract_addr = address or settings.escrow_v2_contract_address
+    if not contract_addr:
+        return None
+    contract_abi = abi or load_v2_contract_abi()
+    if not contract_abi:
+        return None
+    client = w3 or get_web3()
+    checksummed = Web3.to_checksum_address(contract_addr)
+    return client.eth.contract(address=checksummed, abi=contract_abi)
+
 
 
 def load_contract_abi(configured_path: Optional[str | Path] = None) -> Optional[List[dict]]:

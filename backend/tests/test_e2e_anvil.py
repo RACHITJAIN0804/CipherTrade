@@ -20,7 +20,7 @@ import pytest
 from httpx import AsyncClient
 from web3 import Web3
 from eth_account import Account
-from eth_account.messages import encode_defunct
+from eth_account.messages import encode_defunct, encode_typed_data
 
 from app.core.blockchain import get_escrow_contract, get_web3
 from app.models.models import EscrowState
@@ -108,6 +108,46 @@ def _send_on_chain_tx(w3: Web3, sender_addr: str, sender_pk: str, contract_call,
     return w3.to_hex(tx_hash_bytes)
 
 
+async def _sign_mutual_consent(
+    client: AsyncClient,
+    deal_id: str,
+    b_token: str,
+    buyer_info: dict,
+    s_token: str,
+    seller_info: dict,
+):
+    """Obtain challenge and sign mutual EIP-712 agreement consent for buyer and seller."""
+    for token, info in [(b_token, buyer_info), (s_token, seller_info)]:
+        ch_resp = await client.post(
+            f"/api/v1/escrow/deals/{deal_id}/consent/challenge",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ch_resp.status_code == 200, ch_resp.text
+        ch_data = ch_resp.json()
+        eip712_msg = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "AgreementConsent": ch_data["types"]["AgreementConsent"],
+            },
+            "primaryType": "AgreementConsent",
+            "domain": ch_data["domain"],
+            "message": ch_data["message"],
+        }
+        raw_sig = Account.from_key(info["pk"]).sign_message(encode_typed_data(full_message=eip712_msg)).signature.hex()
+        sig = ("0x" + raw_sig) if not raw_sig.startswith("0x") else raw_sig
+        ver_resp = await client.post(
+            f"/api/v1/escrow/deals/{deal_id}/consent/verify",
+            json={"nonce": ch_data["nonce"], "signature": sig},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ver_resp.status_code == 200, ver_resp.text
+
+
 @pytest.mark.asyncio
 async def test_e2e_complete_buyer_seller_happy_path(client: AsyncClient):
     """
@@ -165,28 +205,28 @@ async def test_e2e_complete_buyer_seller_happy_path(client: AsyncClient):
     assert accept_resp.status_code == 200
 
     # 5. Buyer creates backend escrow deal
-    agreement_hash_hex = "0x" + "11" * 32
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
         json={
             "offer_id": offer_id,
-            "amount_eth": amount_eth,
-            "deadline_ts": deadline,
-            "agreement_hash": agreement_hash_hex,
         },
         headers={"Authorization": f"Bearer {b_token}"},
     )
     assert deal_resp.status_code == 201
     deal_data = deal_resp.json()
     deal_id = deal_data["id"]
+    ag_hash = deal_data["agreement_hash"]
     assert deal_data["on_chain_state"] is None
+
+    # Sign mutual cryptographic consent
+    await _sign_mutual_consent(client, deal_id, b_token, buyer_info, s_token, seller_info)
 
     # 6. Execute real on-chain fundDeal() via Web3 from Buyer account
     value_wei = w3.to_wei(amount_eth, "ether")
     fund_fn = contract.functions.fundDeal(
         seller_info["address"],
         deadline,
-        bytes.fromhex(agreement_hash_hex[2:]),
+        bytes.fromhex(ag_hash[2:]),
     )
     tx_hash = _send_on_chain_tx(w3, buyer_info["address"], buyer_info["pk"], fund_fn, value_wei=value_wei)
     assert tx_hash.startswith("0x")
@@ -303,10 +343,16 @@ async def test_e2e_voluntary_seller_refund(client: AsyncClient):
     ag_hash = "0x" + "22" * 32
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
-        json={"offer_id": offer_id, "amount_eth": amount_eth, "deadline_ts": deadline, "agreement_hash": ag_hash},
+        json={"offer_id": offer_id},
         headers={"Authorization": f"Bearer {b_token}"},
     )
-    deal_id = deal_resp.json()["id"]
+    assert deal_resp.status_code == 201
+    deal_data = deal_resp.json()
+    deal_id = deal_data["id"]
+    ag_hash = deal_data["agreement_hash"]
+
+    # Sign mutual cryptographic consent
+    await _sign_mutual_consent(client, deal_id, b_token, buyer_info, s_token, seller_info)
 
     # Fund deal on-chain
     value_wei = w3.to_wei(amount_eth, "ether")
@@ -377,10 +423,16 @@ async def test_e2e_buyer_cancel_expired_deal(client: AsyncClient):
     ag_hash = "0x" + "33" * 32
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
-        json={"offer_id": offer_id, "amount_eth": amount_eth, "deadline_ts": deadline, "agreement_hash": ag_hash},
+        json={"offer_id": offer_id},
         headers={"Authorization": f"Bearer {b_token}"},
     )
-    deal_id = deal_resp.json()["id"]
+    assert deal_resp.status_code == 201
+    deal_data = deal_resp.json()
+    deal_id = deal_data["id"]
+    ag_hash = deal_data["agreement_hash"]
+
+    # Sign mutual cryptographic consent
+    await _sign_mutual_consent(client, deal_id, b_token, buyer_info, s_token, seller_info)
 
     # Fund on-chain
     value_wei = w3.to_wei(amount_eth, "ether")
@@ -466,10 +518,16 @@ async def test_e2e_dispute_and_resolution(client: AsyncClient):
     ag_hash = "0x" + "44" * 32
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
-        json={"offer_id": offer_id, "amount_eth": amount_eth, "deadline_ts": deadline, "agreement_hash": ag_hash},
+        json={"offer_id": offer_id},
         headers={"Authorization": f"Bearer {b_token}"},
     )
-    deal_id = deal_resp.json()["id"]
+    assert deal_resp.status_code == 201
+    deal_data = deal_resp.json()
+    deal_id = deal_data["id"]
+    ag_hash = deal_data["agreement_hash"]
+
+    # Sign mutual cryptographic consent
+    await _sign_mutual_consent(client, deal_id, b_token, buyer_info, s_token, seller_info)
 
     value_wei = w3.to_wei(amount_eth, "ether")
     fund_fn = contract.functions.fundDeal(seller_info["address"], deadline, bytes.fromhex(ag_hash[2:]))
@@ -551,10 +609,16 @@ async def test_e2e_security_role_rejection_and_isolation(client: AsyncClient):
     ag_hash = "0x" + "55" * 32
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
-        json={"offer_id": offer_id, "amount_eth": amount_eth, "deadline_ts": deadline, "agreement_hash": ag_hash},
+        json={"offer_id": offer_id},
         headers={"Authorization": f"Bearer {b_token}"},
     )
-    deal_id = deal_resp.json()["id"]
+    assert deal_resp.status_code == 201
+    deal_data = deal_resp.json()
+    deal_id = deal_data["id"]
+    ag_hash = deal_data["agreement_hash"]
+
+    # Sign mutual cryptographic consent
+    await _sign_mutual_consent(client, deal_id, b_token, buyer_info, s_token, seller_info)
 
     # Fund on-chain
     value_wei = w3.to_wei(amount_eth, "ether")

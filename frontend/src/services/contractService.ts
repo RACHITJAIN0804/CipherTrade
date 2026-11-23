@@ -9,10 +9,15 @@ import {
   keccak256,
   toUtf8Bytes,
 } from 'ethers';
-import { ESCROW_CONTRACT_ADDRESS, ESCROW_ABI } from '../config/contracts.ts';
+import {
+  ESCROW_CONTRACT_ADDRESS,
+  ESCROW_ABI,
+  ESCROW_V2_CONTRACT_ADDRESS,
+  ESCROW_V2_ABI,
+} from '../config/contracts.ts';
 
 /**
- * On-chain lifecycle states defined in CipherTradeEscrow.sol:
+ * On-chain lifecycle states defined in CipherTradeEscrow.sol and CipherTradeEscrowV2.sol:
  * enum State { FUNDED, CONFIRMED, RELEASED, REFUNDED, CANCELLED, DISPUTED, RESOLVED }
  */
 export const OnChainEscrowState = {
@@ -54,6 +59,8 @@ export interface OnChainDeal {
   fundsWithdrawn: boolean;
 }
 
+// ─── V1 (Legacy) Types ───────────────────────────────────────────────────────
+
 export interface FundDealParams {
   sellerAddress: string;
   deadlineTs: number;
@@ -75,14 +82,78 @@ export interface FundDealResult {
   gasUsed?: bigint;
 }
 
+// ─── V2 (Dual-Consent) Types ─────────────────────────────────────────────────
+
 /**
- * Instantiate an ethers.js Contract instance for CipherTradeEscrow.
+ * ContractFundingPayload mirrors the backend ContractFundingPayloadResponse schema
+ * from backend/app/schemas/consent.py.
+ */
+export interface CommercialAgreementPayload {
+  agreementHash: string;  // 0x + 64 hex chars (bytes32)
+  offerId: string;        // UUID string
+  dealId: string;         // UUID string
+  buyer: string;          // checksummed Ethereum address
+  seller: string;         // checksummed Ethereum address
+  amount: string;         // Wei as decimal string
+  deliveryDeadline: number; // Unix timestamp
+}
+
+export interface PartyConsentProofPayload {
+  nonce: string;      // 64-char hex string
+  deadline: number;   // Unix timestamp
+  signature: string;  // 0x + 130 hex chars (65 bytes ECDSA)
+}
+
+export interface ContractFundingPayload {
+  deal_id: string;
+  agreement: CommercialAgreementPayload;
+  buyerConsent: PartyConsentProofPayload;
+  sellerConsent: PartyConsentProofPayload;
+  contract_address: string | null;
+}
+
+export interface FundDealWithConsentResult {
+  txHash: string;
+  chainDealId: number;
+  blockNumber: number;
+  buyer: string;
+  seller: string;
+  amountWei: bigint;
+  amountEth: string;
+  agreementHash: string;
+  dealUuid: string;
+  gasUsed?: bigint;
+  contractAddress: string;
+}
+
+// ─── V1 Contract Helpers ─────────────────────────────────────────────────────
+
+/**
+ * Instantiate an ethers.js Contract instance for CipherTradeEscrow (V1).
  */
 export function getEscrowContract(
   runner: ContractRunner,
   contractAddress: string = ESCROW_CONTRACT_ADDRESS
 ): Contract {
   return new Contract(contractAddress, ESCROW_ABI, runner);
+}
+
+/**
+ * Instantiate an ethers.js Contract instance for CipherTradeEscrowV2.
+ * Throws if V2 address is not configured.
+ */
+export function getEscrowV2Contract(
+  runner: ContractRunner,
+  contractAddress?: string
+): Contract {
+  const addr = contractAddress ?? ESCROW_V2_CONTRACT_ADDRESS;
+  if (!addr || !isAddress(addr)) {
+    throw new Error(
+      'CipherTradeEscrowV2 contract address is not configured. ' +
+      'Set VITE_ESCROW_V2_CONTRACT_ADDRESS in your .env file after deployment.'
+    );
+  }
+  return new Contract(addr, ESCROW_V2_ABI, runner);
 }
 
 /**
@@ -98,7 +169,7 @@ export async function getNextDealId(
 }
 
 /**
- * Fetch and format on-chain deal record by deal ID.
+ * Fetch and format on-chain deal record by deal ID (V1 contract).
  */
 export async function getOnChainDeal(
   dealId: number | bigint,
@@ -116,6 +187,42 @@ export async function getOnChainDeal(
   const agreementHash = String(raw[4] || raw.agreementHash);
   const stateNum = Number(raw[5] !== undefined ? raw[5] : raw.state);
   const fundsWithdrawn = Boolean(raw[6] !== undefined ? raw[6] : raw.fundsWithdrawn);
+
+  return {
+    dealId: Number(dealId),
+    buyer,
+    seller,
+    amount,
+    amountEth: formatEther(amount),
+    deadline,
+    deadlineDate: new Date(Number(deadline) * 1000),
+    agreementHash,
+    state: stateNum as OnChainEscrowState,
+    stateName: ON_CHAIN_STATE_NAMES[stateNum] ?? 'UNKNOWN',
+    fundsWithdrawn,
+  };
+}
+
+/**
+ * Fetch and format on-chain deal record by deal ID (V2 contract).
+ * V2 Deal struct: [buyer, seller, amount, deadline, agreementHash, dealUuidHash, state, fundsWithdrawn]
+ */
+export async function getOnChainDealV2(
+  dealId: number | bigint,
+  runner: ContractRunner,
+  contractAddress?: string
+): Promise<OnChainDeal> {
+  const contract = getEscrowV2Contract(runner, contractAddress);
+  const raw = await contract.getDeal(dealId);
+
+  const buyer = getAddress(raw[0] || raw.buyer);
+  const seller = getAddress(raw[1] || raw.seller);
+  const amount = BigInt(raw[2] || raw.amount);
+  const deadline = BigInt(raw[3] || raw.deadline);
+  const agreementHash = String(raw[4] || raw.agreementHash);
+  // raw[5] is dealUuidHash — skip
+  const stateNum = Number(raw[6] !== undefined ? raw[6] : raw.state);
+  const fundsWithdrawn = Boolean(raw[7] !== undefined ? raw[7] : raw.fundsWithdrawn);
 
   return {
     dealId: Number(dealId),
@@ -200,7 +307,10 @@ export function validateFundDealParams(params: FundDealParams, buyerAddress: str
 }
 
 /**
- * Execute fundDeal transaction on the CipherTradeEscrow contract.
+ * Execute fundDeal transaction on the CipherTradeEscrow contract (V1 — LEGACY).
+ *
+ * This function is preserved for existing funded deals only. New deals must use
+ * fundEscrowDealWithConsent() against CipherTradeEscrowV2.
  *
  * 1. Validates inputs thoroughly.
  * 2. Converts amount to Wei safely via parseEther (no float math).
@@ -249,7 +359,7 @@ export async function fundEscrowDeal(
         data: log.data,
       });
       if (parsed && parsed.name === 'DealFunded') {
-        // DealFunded(dealId, buyer, seller, amount, deadline, agreementHash)
+        // V1 DealFunded(dealId, buyer, seller, amount, deadline, agreementHash)
         chainDealId = Number(parsed.args.dealId ?? parsed.args[0]);
         break;
       }
@@ -277,6 +387,227 @@ export async function fundEscrowDeal(
   };
 }
 
+// ─── V2 (Dual-Consent) Funding ───────────────────────────────────────────────
+
+/**
+ * Validate the backend contract funding payload before submitting on-chain.
+ */
+export function validateContractFundingPayload(
+  payload: ContractFundingPayload,
+  buyerAddress: string,
+  requiredChainId: number
+): void {
+  if (
+    !payload.contract_address || !isAddress(payload.contract_address)
+  ) {
+    throw new Error(
+      'Invalid or missing V2 contract address in backend payload. ' +
+      'The backend returned a configuration error (503). ' +
+      'Ensure ESCROW_V2_CONTRACT_ADDRESS is set in the backend environment.'
+    );
+  }
+
+  if (
+    payload.contract_address.toLowerCase() === ESCROW_CONTRACT_ADDRESS.toLowerCase()
+  ) {
+    throw new Error(
+      'V2 funding cannot use V1 contract address. Potential contract address confusion detected.'
+    );
+  }
+
+  if (
+    !ESCROW_V2_CONTRACT_ADDRESS ||
+    !isAddress(ESCROW_V2_CONTRACT_ADDRESS)
+  ) {
+    throw new Error(
+      'CipherTradeEscrowV2 address is not configured in the frontend. ' +
+      'Set VITE_ESCROW_V2_CONTRACT_ADDRESS in the frontend .env file.'
+    );
+  }
+
+  if (
+    getAddress(payload.contract_address).toLowerCase() !==
+    getAddress(ESCROW_V2_CONTRACT_ADDRESS).toLowerCase()
+  ) {
+    throw new Error(
+      `Backend contract address (${payload.contract_address}) does not match ` +
+      `frontend configured V2 address (${ESCROW_V2_CONTRACT_ADDRESS}). ` +
+      'Addresses must match exactly. Check deployment configuration.'
+    );
+  }
+
+  const { agreement, buyerConsent, sellerConsent } = payload;
+
+  if (!agreement.agreementHash || !/^0x[0-9a-fA-F]{64}$/.test(agreement.agreementHash)) {
+    throw new Error('Invalid agreementHash in payload. Must be 0x + 64 hex chars.');
+  }
+
+  if (!agreement.buyer || !isAddress(agreement.buyer)) {
+    throw new Error('Invalid buyer address in agreement payload.');
+  }
+
+  if (!agreement.seller || !isAddress(agreement.seller)) {
+    throw new Error('Invalid seller address in agreement payload.');
+  }
+
+  if (
+    getAddress(agreement.buyer).toLowerCase() !== getAddress(buyerAddress).toLowerCase()
+  ) {
+    throw new Error(
+      `Connected wallet (${buyerAddress}) does not match the authorized buyer ` +
+      `in the payload (${agreement.buyer}). Please switch to the buyer account in MetaMask.`
+    );
+  }
+
+  if (!agreement.amount || !/^\d+$/.test(agreement.amount)) {
+    throw new Error('Invalid amount in agreement payload: must be a decimal Wei string.');
+  }
+
+  if (!agreement.deliveryDeadline || agreement.deliveryDeadline <= 0) {
+    throw new Error('Invalid deliveryDeadline in agreement payload.');
+  }
+
+  for (const [role, proof] of [['buyer', buyerConsent], ['seller', sellerConsent]] as const) {
+    if (!proof.nonce || !/^[0-9a-fA-F]{64}$/.test(proof.nonce)) {
+      throw new Error(`Invalid nonce in ${role} consent proof.`);
+    }
+    if (!proof.deadline || proof.deadline <= 0) {
+      throw new Error(`Invalid deadline in ${role} consent proof.`);
+    }
+    const currentTs = Math.floor(Date.now() / 1000);
+    if (proof.deadline < currentTs) {
+      throw new Error(
+        `${role.charAt(0).toUpperCase() + role.slice(1)} consent proof has expired ` +
+        `(deadline: ${proof.deadline}, current: ${currentTs}). Please re-sign consent.`
+      );
+    }
+    if (!proof.signature || !/^0x[0-9a-fA-F]{130}$/.test(proof.signature)) {
+      throw new Error(`Invalid signature in ${role} consent proof. Must be 0x + 130 hex chars.`);
+    }
+  }
+
+  void requiredChainId; // Chain ID enforced by wallet context upstream
+}
+
+/**
+ * Execute fundDealWithConsent() on CipherTradeEscrowV2.
+ *
+ * Uses the backend-validated payload returned by GET /api/v1/deals/{deal_id}/contract-payload.
+ * Does NOT reconstruct or modify the signed agreement or consent proofs.
+ *
+ * Security requirements enforced:
+ *  1. Connected wallet must be the authorized buyer.
+ *  2. Backend and frontend V2 addresses must match.
+ *  3. All consent deadlines must still be valid.
+ *  4. Amount is passed as BigInt from the backend Wei string.
+ *  5. DealFunded event must be present in the confirmed receipt.
+ *  6. chainDealId is extracted from the event (not from return value).
+ */
+export async function fundEscrowDealWithConsent(
+  payload: ContractFundingPayload,
+  signer: JsonRpcSigner,
+  onTxSubmitted?: (txHash: string) => void
+): Promise<FundDealWithConsentResult> {
+  const buyerAddress = await signer.getAddress();
+  validateContractFundingPayload(payload, buyerAddress, 31337);
+
+  const { agreement, buyerConsent, sellerConsent } = payload;
+  const contractAddress = getAddress(payload.contract_address!);
+
+  const contract = getEscrowV2Contract(signer, contractAddress);
+
+  // Construct Solidity CommercialAgreement struct exactly:
+  // bytes32 agreementHash, string offerId, string dealId,
+  // address buyer, address seller, uint256 amount, uint256 deliveryDeadline
+  const agreementStruct = {
+    agreementHash: agreement.agreementHash as `0x${string}`,
+    offerId: agreement.offerId,
+    dealId: agreement.dealId,
+    buyer: getAddress(agreement.buyer),
+    seller: getAddress(agreement.seller),
+    amount: BigInt(agreement.amount),         // Wei as BigInt
+    deliveryDeadline: BigInt(agreement.deliveryDeadline),
+  };
+
+  // Construct Solidity PartyConsentProof structs exactly:
+  // string nonce, uint256 deadline, bytes signature
+  const buyerConsentStruct = {
+    nonce: buyerConsent.nonce,
+    deadline: BigInt(buyerConsent.deadline),
+    signature: buyerConsent.signature as `0x${string}`,
+  };
+
+  const sellerConsentStruct = {
+    nonce: sellerConsent.nonce,
+    deadline: BigInt(sellerConsent.deadline),
+    signature: sellerConsent.signature as `0x${string}`,
+  };
+
+  // Amount to send with the transaction
+  const amountWei = BigInt(agreement.amount);
+
+  // Submit fundDealWithConsent transaction
+  const tx = await contract.fundDealWithConsent(
+    agreementStruct,
+    buyerConsentStruct,
+    sellerConsentStruct,
+    { value: amountWei }
+  );
+
+  if (onTxSubmitted && tx.hash) {
+    onTxSubmitted(tx.hash);
+  }
+
+  // Wait for 1 confirmation
+  const receipt = await tx.wait(1);
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(
+      `fundDealWithConsent transaction failed or reverted on-chain. ` +
+      `Status: ${receipt?.status}, Hash: ${receipt?.hash}`
+    );
+  }
+
+  // Parse DealFunded event from V2 contract
+  // V2 DealFunded(uint256 chainDealId, bytes32 dealUuidHash, address buyer,
+  //               address seller, uint256 amount, uint256 deliveryDeadline,
+  //               bytes32 agreementHash, string dealUuid, string offerId)
+  let chainDealId: number | null = null;
+  for (const log of receipt.logs) {
+    try {
+      const parsed = contract.interface.parseLog({
+        topics: log.topics as string[],
+        data: log.data,
+      });
+      if (parsed && parsed.name === 'DealFunded') {
+        chainDealId = Number(parsed.args.chainDealId ?? parsed.args[0]);
+        break;
+      }
+    } catch {
+      // Not a log from this contract
+    }
+  }
+
+  if (chainDealId === null || isNaN(chainDealId)) {
+    throw new Error(
+      `fundDealWithConsent confirmed (${receipt.hash}) but DealFunded event not found in logs.`
+    );
+  }
+
+  return {
+    txHash: receipt.hash,
+    chainDealId,
+    blockNumber: receipt.blockNumber,
+    buyer: buyerAddress,
+    seller: getAddress(agreement.seller),
+    amountWei,
+    amountEth: formatEther(amountWei),
+    agreementHash: agreement.agreementHash,
+    dealUuid: agreement.dealId,
+    gasUsed: receipt.gasUsed,
+    contractAddress,
+  };
+}
+
 /**
  * Format user-friendly error messages from contract/provider errors.
  */
@@ -301,42 +632,36 @@ export function formatContractError(err: unknown): string {
     return 'Insufficient funds in your wallet to cover the escrow amount and gas fee.';
   }
 
-  // Contract custom errors
+  // V2 custom errors
   const rawMsg = String(errorObj.reason || errorObj.shortMessage || errorObj.message || '');
-  if (rawMsg.includes('SelfDeal')) {
-    return 'Cannot fund a deal where buyer and seller are the same wallet address.';
-  }
-  if (rawMsg.includes('ZeroAmount')) {
-    return 'Escrow amount must be greater than zero.';
-  }
-  if (rawMsg.includes('InvalidDeadline')) {
-    return 'The delivery deadline must be set in the future.';
-  }
-  if (rawMsg.includes('Reentrancy')) {
-    return 'Transaction rejected due to contract reentrancy guard.';
-  }
-  if (rawMsg.includes('Unauthorized')) {
-    return 'You are not authorized to perform this operation.';
-  }
-  if (rawMsg.includes('DeadlineNotReached')) {
-    return 'The delivery deadline has not elapsed yet. Cancellation is not allowed before the deadline.';
-  }
-  if (rawMsg.includes('AlreadyWithdrawn')) {
-    return 'Funds for this escrow deal have already been withdrawn or settled.';
-  }
-  if (rawMsg.includes('InvalidState')) {
-    return 'The escrow deal is not in an eligible state for this action.';
-  }
-  if (rawMsg.includes('TransferFailed')) {
-    return 'ETH transfer failed on-chain.';
-  }
+  if (rawMsg.includes('SelfDeal')) return 'Cannot fund a deal where buyer and seller are the same wallet address.';
+  if (rawMsg.includes('ZeroAmount')) return 'Escrow amount must be greater than zero.';
+  if (rawMsg.includes('InvalidDeadline')) return 'The delivery deadline must be set in the future.';
+  if (rawMsg.includes('ConsentExpired')) return 'One or both consent signatures have expired. Please refresh consent.';
+  if (rawMsg.includes('NonceReplayed')) return 'A consent nonce has already been used. Please refresh consent.';
+  if (rawMsg.includes('SignerMismatch')) return 'Signature signer does not match the authorized buyer or seller address.';
+  if (rawMsg.includes('DealAlreadyFunded')) return 'This deal UUID has already been funded on-chain.';
+  if (rawMsg.includes('AmountMismatch')) return 'Transaction value does not match the agreed escrow amount.';
+  if (rawMsg.includes('InvalidSignatureLength')) return 'Consent signature length is invalid (must be 65 bytes).';
+  if (rawMsg.includes('InvalidSignatureS')) return 'Consent signature has high-s value (EIP-2 malleability rejected).';
+  if (rawMsg.includes('InvalidSignatureV')) return 'Consent signature has invalid v value (must be 27 or 28).';
+  if (rawMsg.includes('UnauthorizedCaller')) return 'Only the buyer can call fundDealWithConsent.';
+  if (rawMsg.includes('Unauthorized')) return 'You are not authorized to perform this operation.';
+  if (rawMsg.includes('ZeroAddress')) return 'Buyer or seller address is the zero address.';
+  if (rawMsg.includes('Reentrancy')) return 'Transaction rejected due to contract reentrancy guard.';
+  if (rawMsg.includes('TransferFailed')) return 'ETH transfer failed on-chain.';
+
+  // V1 fallback errors
+  if (rawMsg.includes('DeadlineNotReached')) return 'The delivery deadline has not elapsed yet. Cancellation is not allowed before the deadline.';
+  if (rawMsg.includes('AlreadyWithdrawn')) return 'Funds for this escrow deal have already been withdrawn or settled.';
+  if (rawMsg.includes('InvalidState')) return 'The escrow deal is not in an eligible state for this action.';
 
   return rawMsg || 'Failed to complete transaction on the blockchain.';
 }
 
 /**
  * Buyer confirms delivery on-chain.
- * Solidity: confirmDelivery(uint256 dealId) [onlyBuyer, FUNDED]
+ * Compatible with both V1 and V2 (same function signature).
  */
 export async function confirmDeliveryOnChain(
   chainDealId: number,
@@ -356,7 +681,7 @@ export async function confirmDeliveryOnChain(
 
 /**
  * Buyer cancels expired deal and reclaims escrowed funds.
- * Solidity: cancelExpired(uint256 dealId) [onlyBuyer, FUNDED, timestamp > deadline]
+ * Compatible with both V1 and V2 (same function signature).
  */
 export async function cancelExpiredOnChain(
   chainDealId: number,
@@ -376,7 +701,7 @@ export async function cancelExpiredOnChain(
 
 /**
  * Seller withdraws payment after buyer has confirmed delivery (pull payment pattern).
- * Solidity: withdrawPayment(uint256 dealId) [onlySeller, CONFIRMED]
+ * Compatible with both V1 and V2 (same function signature).
  */
 export async function withdrawPaymentOnChain(
   chainDealId: number,
@@ -396,7 +721,7 @@ export async function withdrawPaymentOnChain(
 
 /**
  * Seller voluntarily refunds the buyer before delivery is confirmed.
- * Solidity: refundBuyer(uint256 dealId) [onlySeller, FUNDED]
+ * Compatible with both V1 and V2 (same function signature).
  */
 export async function refundBuyerOnChain(
   chainDealId: number,
@@ -416,7 +741,7 @@ export async function refundBuyerOnChain(
 
 /**
  * Either party (buyer or seller) raises a dispute, freezing funds for arbitrator.
- * Solidity: raiseDispute(uint256 dealId) [onlyParty, FUNDED or CONFIRMED]
+ * Compatible with both V1 and V2 (same function signature).
  */
 export async function raiseDisputeOnChain(
   chainDealId: number,

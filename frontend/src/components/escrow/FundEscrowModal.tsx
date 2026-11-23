@@ -19,9 +19,10 @@ import {
 import { isAddress, getAddress, parseEther } from 'ethers';
 import { useWallet } from '../../context/WalletContext';
 import {
-  fundEscrowDeal,
+  fundEscrowDealWithConsent,
   formatContractError,
   type FundDealResult,
+  type FundDealWithConsentResult,
 } from '../../services/contractService';
 import {
   createEscrowDeal,
@@ -32,11 +33,17 @@ import {
   requestConsentChallenge,
   verifyConsentSignature,
   validateConsentDomain,
+  getContractFundingPayload,
   type ConsentStatusResponse,
 } from '../../services/escrowService';
 import { getUser } from '../../services/userService';
 
-import { ESCROW_CONTRACT_ADDRESS, ESCROW_CHAIN_ID } from '../../config/contracts';
+import {
+  ESCROW_CONTRACT_ADDRESS,
+  ESCROW_V2_CONTRACT_ADDRESS,
+  ESCROW_CHAIN_ID,
+  escrowV2Config,
+} from '../../config/contracts';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
@@ -54,7 +61,7 @@ export interface FundEscrowModalProps {
   deliveryDeadline?: number; // Unix timestamp in seconds
   terms?: string;
   agreementHash?: string;
-  onSuccess?: (result: { onChain: FundDealResult; deal: EscrowDeal }) => void;
+  onSuccess?: (result: { onChain: FundDealResult | FundDealWithConsentResult; deal: EscrowDeal }) => void;
 }
 
 type Step =
@@ -109,7 +116,8 @@ export function FundEscrowModal({
   // Flow & transaction state
   const [step, setStep] = useState<Step>('form');
   const [pendingTxHash, setPendingTxHash] = useState<string | null>(null);
-  const [confirmedResult, setConfirmedResult] = useState<FundDealResult | null>(null);
+  const [confirmedResult, setConfirmedResult] = useState<FundDealResult | FundDealWithConsentResult | null>(null);
+  const [isLoadingPayload, setIsLoadingPayload] = useState(false);
   const [verifiedDeal, setVerifiedDeal] = useState<EscrowDeal | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [verificationError, setVerificationError] = useState<string | null>(null);
@@ -264,7 +272,7 @@ export function FundEscrowModal({
       const challenge = await requestConsentChallenge(targetId, isOffer);
 
       // Validate EIP-712 challenge domain and connected chain before presenting signature prompt
-      validateConsentDomain(challenge.domain, chainId);
+      validateConsentDomain(challenge.domain, chainId, ESCROW_V2_CONTRACT_ADDRESS || undefined);
 
       // Verify connected wallet matches challenge signer
       if (getAddress(account).toLowerCase() !== getAddress(challenge.message.signer).toLowerCase()) {
@@ -354,8 +362,10 @@ export function FundEscrowModal({
     isHashValid &&
     !isLoadingAgreement &&
     !agreementError &&
+    !isLoadingPayload &&
     !isSelfDeal &&
     bothConsented &&
+    escrowV2Config.isConfigured &&
     step === 'form';
 
   /**
@@ -422,7 +432,6 @@ export function FundEscrowModal({
 
       // Pre-flight 2: Create or retrieve backend EscrowDeal record to obtain the authoritative deal UUID
       let targetDealId = activeDealId;
-      let finalAgreementHash = effectiveHash;
 
       if (!targetDealId && offerId) {
         try {
@@ -431,11 +440,6 @@ export function FundEscrowModal({
           });
           targetDealId = dealRecord.id;
           setActiveDealId(dealRecord.id);
-
-          // If the deal had an existing agreement_hash, adopt it
-          if (dealRecord.agreement_hash) {
-            finalAgreementHash = dealRecord.agreement_hash;
-          }
         } catch (dealErr: unknown) {
           const msg =
             (dealErr as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
@@ -446,31 +450,53 @@ export function FundEscrowModal({
         }
       }
 
+      if (!targetDealId) {
+        setErrorMessage('Cannot proceed: valid deal ID is required for dual-consent escrow funding.');
+        return;
+      }
+
+      // Pre-flight 3: Ensure V2 contract configuration exists
+      if (!escrowV2Config.isConfigured) {
+        setErrorMessage(
+          'CipherTradeEscrowV2 contract is not configured on this frontend. Please set VITE_ESCROW_V2_CONTRACT_ADDRESS.'
+        );
+        return;
+      }
+
+      // Step: Fetch contract-ready dual-consent funding payload from backend
+      setIsLoadingPayload(true);
+      let fundingPayload;
+      try {
+        fundingPayload = await getContractFundingPayload(targetDealId);
+      } catch (payloadErr: unknown) {
+        const msg =
+          (payloadErr as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
+          (payloadErr as Error)?.message ??
+          'Failed to retrieve contract funding payload from backend.';
+        setErrorMessage(msg);
+        setStep('blockchain_error');
+        return;
+      } finally {
+        setIsLoadingPayload(false);
+      }
+
       // Step: Awaiting MetaMask signature
       setStep('awaiting_signature');
 
-      // Dispatch smart contract transaction
-      const onChainResult = await fundEscrowDeal({
-        sellerAddress: sellerAddr,
-        deadlineTs: computedDeadlineTs,
-        agreementHash: finalAgreementHash,
-        amountEth: amount,
+      // Dispatch V2 dual-consent smart contract transaction
+      const onChainResult = await fundEscrowDealWithConsent(
+        fundingPayload,
         signer,
-        onTxSubmitted: (txHash: string) => {
+        (txHash: string) => {
           setPendingTxHash(txHash);
           setStep('pending_tx');
-        },
-      });
+        }
+      );
 
       setConfirmedResult(onChainResult);
 
       // Step: Trigger backend independent verification
-      if (targetDealId) {
-        await executeBackendVerification(targetDealId, onChainResult.txHash);
-      } else {
-        // Fallback: If no backend deal ID could be established, remain in confirmed state
-        setStep('verified');
-      }
+      await executeBackendVerification(targetDealId, onChainResult.txHash);
     } catch (err: unknown) {
       const formatted = formatContractError(err);
       setErrorMessage(formatted);
@@ -548,8 +574,12 @@ export function FundEscrowModal({
           <div className="space-y-4">
             {/* Contract info bar */}
             <div className="px-3.5 py-2.5 rounded-lg bg-slate-900/60 border border-slate-800 text-xs text-slate-400 flex items-center justify-between">
-              <span>Escrow Contract:</span>
-              <span className="font-mono text-cyan-400">{formatAddress(ESCROW_CONTRACT_ADDRESS)}</span>
+              <span>Escrow Contract (V2 Dual-Consent):</span>
+              <span className="font-mono text-cyan-400">
+                {escrowV2Config.isConfigured
+                  ? formatAddress(ESCROW_V2_CONTRACT_ADDRESS)
+                  : 'Not Configured'}
+              </span>
             </div>
 
             {/* Seller Address */}
@@ -791,7 +821,11 @@ export function FundEscrowModal({
               </div>
               <div className="flex justify-between text-slate-400">
                 <span>Target Contract:</span>
-                <span className="font-mono text-cyan-400">{formatAddress(ESCROW_CONTRACT_ADDRESS)}</span>
+                <span className="font-mono text-cyan-400">
+                  {escrowV2Config.isConfigured
+                    ? `${formatAddress(ESCROW_V2_CONTRACT_ADDRESS)} (V2)`
+                    : formatAddress(ESCROW_CONTRACT_ADDRESS)}
+                </span>
               </div>
               <div className="flex justify-between text-slate-400">
                 <span>Network:</span>
@@ -826,7 +860,7 @@ export function FundEscrowModal({
             <div>
               <h3 className="text-lg font-semibold text-white">Awaiting MetaMask Confirmation</h3>
               <p className="text-sm text-slate-400 max-w-sm mt-1">
-                Please review and approve the <code className="text-cyan-400 font-mono">fundDeal</code> transaction in your MetaMask wallet popup.
+                Please review and approve the <code className="text-cyan-400 font-mono">fundDealWithConsent</code> transaction in your MetaMask wallet popup.
               </p>
             </div>
             <div className="p-3 rounded-lg bg-blue-900/20 border border-blue-500/20 text-xs text-blue-300 max-w-md">

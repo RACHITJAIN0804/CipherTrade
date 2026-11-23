@@ -34,6 +34,7 @@ from web3 import Web3
 from app.config import get_settings
 from app.core.blockchain import (
     get_escrow_contract,
+    get_escrow_v2_contract,
     get_web3,
     load_contract_abi,
 )
@@ -223,10 +224,23 @@ async def verify_funding_transaction(
         raise ValueError("Transaction failed on chain (status 0).")
 
     # 9. Verify destination contract address
-    contract_address = Web3.to_checksum_address(settings.escrow_contract_address)
+    v1_address = Web3.to_checksum_address(settings.escrow_contract_address) if settings.escrow_contract_address else None
+    v2_address = Web3.to_checksum_address(settings.escrow_v2_contract_address) if settings.escrow_v2_contract_address else None
+
     tx_to = tx.get("to") if isinstance(tx, dict) or hasattr(tx, "get") else getattr(tx, "to", None)
-    if not tx_to or Web3.to_checksum_address(tx_to) != contract_address:
-        raise ValueError("Transaction destination does not match the configured escrow contract address.")
+    if not tx_to:
+        raise ValueError("Transaction destination is missing.")
+    tx_to_checksum = Web3.to_checksum_address(tx_to)
+
+    is_v2 = False
+    if v2_address and tx_to_checksum == v2_address:
+        is_v2 = True
+        contract_address = v2_address
+    elif v1_address and tx_to_checksum == v1_address:
+        is_v2 = False
+        contract_address = v1_address
+    else:
+        raise ValueError("Transaction destination does not match any configured escrow contract address.")
 
     # Also verify receipt destination contract address if present
     receipt_to = receipt.get("to") if isinstance(receipt, dict) or hasattr(receipt, "get") else getattr(receipt, "to", None)
@@ -242,7 +256,10 @@ async def verify_funding_transaction(
         raise ValueError("Transaction sender does not match the buyer's registered wallet address.")
 
     # 11. Decode DealFunded event
-    contract = get_escrow_contract(w3)
+    if is_v2:
+        contract = get_escrow_v2_contract(w3)
+    else:
+        contract = get_escrow_contract(w3)
     if contract is None:
         raise ValueError("Escrow contract could not be loaded or ABI artifact is missing.")
 
@@ -261,7 +278,22 @@ async def verify_funding_transaction(
         raise ValueError("DealFunded event was not emitted by the configured escrow contract.")
 
     # 12. Extract on-chain deal ID and ensure uniqueness
-    chain_deal_id = int(event_args["dealId"])
+    if is_v2:
+        chain_deal_id = int(event_args["chainDealId"])
+        # Verify deal UUID mapping
+        event_deal_uuid = str(event_args.get("dealUuid", ""))
+        if event_deal_uuid != str(deal.id):
+            raise ValueError(f"Event deal UUID ({event_deal_uuid}) does not match deal ID ({deal.id}).")
+        expected_uuid_hash = Web3.keccak(text=str(deal.id))
+        event_uuid_hash = event_args.get("dealUuidHash")
+        if isinstance(event_uuid_hash, (bytes, bytearray)):
+            if event_uuid_hash != expected_uuid_hash:
+                raise ValueError("Event dealUuidHash mismatch.")
+        elif str(event_uuid_hash).lower() != expected_uuid_hash.hex().lower():
+            raise ValueError("Event dealUuidHash mismatch.")
+    else:
+        chain_deal_id = int(event_args["dealId"])
+
     stmt_chain = select(EscrowDeal).where(EscrowDeal.chain_deal_id == chain_deal_id, EscrowDeal.id != deal.id)
     other_chain_deal = (await db.execute(stmt_chain)).scalar_one_or_none()
     if other_chain_deal:
@@ -296,7 +328,10 @@ async def verify_funding_transaction(
         raise ValueError(f"Transaction value mismatch. Expected {expected_wei} wei, got {tx_value} wei.")
 
     # 16. Verify deadline
-    event_deadline = int(event_args["deadline"])
+    if is_v2:
+        event_deadline = int(event_args["deliveryDeadline"])
+    else:
+        event_deadline = int(event_args["deadline"])
     if event_deadline != deal.deadline_ts:
         raise ValueError(f"Deadline mismatch. Deal deadline is {deal.deadline_ts}, event has {event_deadline}.")
 
@@ -349,8 +384,18 @@ async def verify_funding_transaction(
     except Exception as exc:
         raise ValueError(f"Failed to read deal from contract getDeal(): {exc}")
 
-    # Struct: (buyer, seller, amount, deadline, agreementHash, state, fundsWithdrawn)
-    (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_state, oc_withdrawn) = on_chain_deal
+    if is_v2:
+        # V2 Struct: (buyer, seller, amount, deadline, agreementHash, dealUuidHash, state, fundsWithdrawn)
+        (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_uuid_hash, oc_state, oc_withdrawn) = on_chain_deal
+        expected_uuid_hash = Web3.keccak(text=str(deal.id))
+        if isinstance(oc_uuid_hash, (bytes, bytearray)):
+            if oc_uuid_hash != expected_uuid_hash:
+                raise ValueError("On-chain deal UUID hash does not match.")
+        elif str(oc_uuid_hash).lower() != expected_uuid_hash.hex().lower():
+            raise ValueError("On-chain deal UUID hash does not match.")
+    else:
+        # V1 Struct: (buyer, seller, amount, deadline, agreementHash, state, fundsWithdrawn)
+        (oc_buyer, oc_seller, oc_amount, oc_deadline, oc_ag_hash, oc_state, oc_withdrawn) = on_chain_deal
 
     if Web3.to_checksum_address(oc_buyer) != buyer_wallet:
         raise ValueError("On-chain deal buyer does not match.")
@@ -379,8 +424,6 @@ async def verify_funding_transaction(
             "Database integrity conflict: the transaction hash or on-chain deal ID is already associated with another deal."
         ) from exc
 
-    logger.info("Successfully verified and marked deal %s as FUNDED (chain_deal_id=%s)", deal.id, chain_deal_id)
-    return deal
     logger.info("Successfully verified and marked deal %s as FUNDED (chain_deal_id=%s)", deal.id, chain_deal_id)
     return deal
 

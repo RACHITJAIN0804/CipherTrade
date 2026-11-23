@@ -1,5 +1,10 @@
 import { apiClient } from './api.ts';
-import { ESCROW_CHAIN_ID, ESCROW_CONTRACT_ADDRESS } from '../config/contracts.ts';
+import {
+  ESCROW_CHAIN_ID,
+  ESCROW_CONTRACT_ADDRESS,
+  ESCROW_V2_CONTRACT_ADDRESS,
+} from '../config/contracts.ts';
+import type { ContractFundingPayload } from './contractService.ts';
 import type { EscrowDeal, EscrowTransaction, PaginatedEscrowDeals, EscrowState } from '../types';
 
 export interface EscrowDealCreate {
@@ -211,12 +216,22 @@ export async function verifyConsentSignature(
 }
 
 /**
+ * Fetch contract-ready funding payload containing canonical agreement and dual EIP-712 consent proofs.
+ * GET /api/v1/deals/{deal_id}/contract-payload
+ */
+export async function getContractFundingPayload(dealId: string): Promise<ContractFundingPayload> {
+  const res = await apiClient.get<ContractFundingPayload>(`/deals/${dealId}/contract-payload`);
+  return res.data;
+}
+
+/**
  * Validates EIP-712 challenge domain parameters against local escrow contract configuration
  * and verifies that the connected wallet network matches before presenting the signature request.
  */
 export function validateConsentDomain(
   domain: ConsentChallengeResponse['domain'],
-  connectedChainId?: number | null
+  connectedChainId?: number | null,
+  expectedContractAddress?: string
 ): void {
   if (!domain) {
     throw new Error('Invalid consent challenge: domain object is missing.');
@@ -232,13 +247,25 @@ export function validateConsentDomain(
       `Consent challenge chain ID (${domain.chainId}) does not match expected escrow network (${ESCROW_CHAIN_ID}).`
     );
   }
-  if (
-    !domain.verifyingContract ||
-    domain.verifyingContract.toLowerCase() !== ESCROW_CONTRACT_ADDRESS.toLowerCase()
-  ) {
-    throw new Error(
-      `Consent challenge contract address (${domain.verifyingContract}) does not match configured escrow contract (${ESCROW_CONTRACT_ADDRESS}).`
-    );
+  if (expectedContractAddress) {
+    if (
+      !domain.verifyingContract ||
+      domain.verifyingContract.toLowerCase() !== expectedContractAddress.toLowerCase()
+    ) {
+      throw new Error(
+        `Consent challenge contract address (${domain.verifyingContract}) does not match expected contract (${expectedContractAddress}).`
+      );
+    }
+  } else {
+    const allowedContracts = [
+      ESCROW_CONTRACT_ADDRESS.toLowerCase(),
+      ...(ESCROW_V2_CONTRACT_ADDRESS ? [ESCROW_V2_CONTRACT_ADDRESS.toLowerCase()] : []),
+    ];
+    if (!domain.verifyingContract || !allowedContracts.includes(domain.verifyingContract.toLowerCase())) {
+      throw new Error(
+        `Consent challenge contract address (${domain.verifyingContract}) does not match configured escrow contract.`
+      );
+    }
   }
   if (
     connectedChainId !== undefined &&

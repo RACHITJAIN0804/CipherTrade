@@ -123,8 +123,6 @@ async def _create_deal(
 
     # 4. Buyer creates escrow deal
     deal_payload: dict[str, Any] = {"offer_id": offer_id}
-    if agreement_hash and agreement_hash != "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef":
-        deal_payload["agreement_hash"] = agreement_hash
     deal_resp = await client.post(
         "/api/v1/escrow/deals",
         json=deal_payload,
@@ -628,7 +626,7 @@ async def test_live_anvil_funding_verification_and_idempotency(client: AsyncClie
     fund_fn = contract.functions.fundDeal(
         seller_addr,
         deadline,
-        bytes.fromhex(agreement_hash_hex[2:]),
+        bytes.fromhex(deal["agreement_hash"][2:]),
     )
     tx_params = {
         "from": buyer_addr,
@@ -851,13 +849,34 @@ async def test_verify_funding_missing_expected_agreement_hash(client: AsyncClien
         }]
         mock_gcontract.return_value = mock_contract
 
-        resp = await client.post(
-            f"/api/v1/escrow/deals/{deal_id}/verify-funding",
-            json={"tx_hash": fake_tx},
-            headers={"Authorization": f"Bearer {buyer_token}"},
-        )
-        assert resp.status_code == 400
-        assert "expected agreement hash" in resp.json()["detail"].lower()
+        import app.services.escrow_service as es_mod
+        from app.models.models import EscrowDeal, Offer
+
+        orig_verify = es_mod.verify_funding_transaction
+        async def patched_verify(*args, **kwargs):
+            db = kwargs.get("db") or (args[0] if len(args) > 0 else None)
+            deal = kwargs.get("deal") or (args[1] if len(args) > 1 else None)
+            if deal:
+                deal.agreement_hash = None
+            if db:
+                orig_execute = db.execute
+                async def mock_exec(stmt, *a, **kw):
+                    if "offers" in str(stmt).lower():
+                        m = MagicMock()
+                        m.scalar_one_or_none.return_value = None
+                        return m
+                    return await orig_execute(stmt, *a, **kw)
+                db.execute = mock_exec
+            return await orig_verify(*args, **kwargs)
+
+        with patch.object(es_mod, "verify_funding_transaction", side_effect=patched_verify):
+            resp = await client.post(
+                f"/api/v1/escrow/deals/{deal_id}/verify-funding",
+                json={"tx_hash": fake_tx},
+                headers={"Authorization": f"Bearer {buyer_token}"},
+            )
+            assert resp.status_code == 400
+            assert "expected agreement hash" in resp.json()["detail"].lower()
 
 
 @pytest.mark.asyncio
@@ -892,6 +911,7 @@ async def test_verify_funding_duplicate_chain_deal_id_conflict(client: AsyncClie
         mock_gw3.return_value = mock_w3
 
         mock_contract = MagicMock()
+        ag_hash1 = deal1["agreement_hash"]
         mock_contract.events.DealFunded.return_value.process_receipt.return_value = [{
             "address": contract_addr,
             "args": {
@@ -900,11 +920,11 @@ async def test_verify_funding_duplicate_chain_deal_id_conflict(client: AsyncClie
                 "seller": seller_wallet,
                 "amount": int(1.5 * 10**18),
                 "deadline": deadline1,
-                "agreementHash": bytes.fromhex(ag_hash[2:]),
+                "agreementHash": bytes.fromhex(ag_hash1[2:]),
             }
         }]
         mock_contract.functions.getDeal.return_value.call.return_value = (
-            buyer_wallet, seller_wallet, int(1.5 * 10**18), deadline1, bytes.fromhex(ag_hash[2:]), 0, False
+            buyer_wallet, seller_wallet, int(1.5 * 10**18), deadline1, bytes.fromhex(ag_hash1[2:]), 0, False
         )
         mock_gcontract.return_value = mock_contract
 
