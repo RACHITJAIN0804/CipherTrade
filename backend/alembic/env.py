@@ -48,6 +48,12 @@ def do_run_migrations(connection):
 
 
 async def run_migrations_online() -> None:
+    # If a connection was explicitly passed in config.attributes, use it directly (e.g. tests)
+    connectable = config.attributes.get("connection", None)
+    if connectable is not None:
+        do_run_migrations(connectable)
+        return
+
     engine = create_async_engine(get_url())
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)

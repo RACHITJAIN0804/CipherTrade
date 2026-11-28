@@ -30,12 +30,31 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[str] = ["http://localhost:5173"]
 
-    # Blockchain (Phase 5)
+    # Blockchain (Phase 5 & Phase 6)
     escrow_contract_address: str = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
     escrow_v2_contract_address: str | None = None
+    escrow_v3_contract_address: str | None = None
     escrow_contract_abi_path: str = "contracts/out/CipherTradeEscrow.sol/CipherTradeEscrow.json"
+    escrow_v3_contract_abi_path: str = "contracts/out/CipherTradeEscrowV3.sol/CipherTradeEscrowV3.json"
     web3_rpc_url: str = "http://127.0.0.1:8545"
     chain_id: int = 31337
+
+    # Chain-Specific Multi-Token Addresses (Phase 6.2.2.3)
+    # Verification TTL for on-chain token checks (seconds)
+    token_verification_ttl_seconds: int = 300
+
+    # Anvil (31337)
+    anvil_escrow_v3_contract_address: str | None = None
+    anvil_usdc_contract_address: str | None = None
+    anvil_usdt_contract_address: str | None = None
+    # Sepolia (11155111)
+    sepolia_escrow_v3_contract_address: str | None = None
+    sepolia_usdc_contract_address: str | None = None
+    sepolia_usdt_contract_address: str | None = None
+
+    # Fee & Treasury (Phase 6 V3)
+    treasury_address: str | None = "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65"
+    platform_fee_bps: int = 250
 
     # SIWE (EIP-4361)
     siwe_domain: str = "localhost"

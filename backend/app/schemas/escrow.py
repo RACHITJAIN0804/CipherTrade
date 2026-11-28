@@ -13,6 +13,12 @@ from app.models.models import EscrowState
 class EscrowDealCreate(BaseModel):
     offer_id: uuid.UUID
     amount_eth: Optional[float] = Field(None, gt=0)
+    amount: Optional[float] = Field(None, gt=0)
+    amount_base_units: Optional[str] = None
+    currency: Optional[str] = None
+    token_address: Optional[str] = None
+    token_decimals: Optional[int] = None
+    contract_version: Optional[str] = None
     deadline_ts: Optional[int] = Field(None, gt=0, description="Unix timestamp passed to fundDeal()")
     agreement_hash: Optional[str] = Field(None, max_length=66)
 
@@ -43,6 +49,15 @@ class EscrowDealRead(BaseModel):
     chain_deal_id: Optional[int]
     fund_tx_hash: Optional[str]
     amount_eth: float
+    chain_id: Optional[int] = None
+    token_address: Optional[str] = None
+    token_symbol: str = "ETH"
+    token_decimals: int = 18
+    amount_base_units: Optional[str] = None
+    fee_bps: Optional[int] = None
+    treasury_address: Optional[str] = None
+    agreement_version: int = 1
+    previous_agreement_hash: Optional[str] = None
     deadline_ts: int
     agreement_hash: Optional[str]
     on_chain_state: Optional[EscrowState]

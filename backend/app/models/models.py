@@ -34,11 +34,19 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy import Uuid  # SQLAlchemy 2 built-in, dialect-aware
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship, synonym
 
 from app.core.database import Base
+from app.core.numeric import (
+    eth_amount_to_base_units_str,
+    validate_base_units_str,
+    decimal_to_base_units_str,
+    base_units_str_to_decimal,
+)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -49,6 +57,54 @@ def _now() -> datetime:
 
 def _uuid() -> uuid.UUID:
     return uuid.uuid4()
+
+
+def _derive_offer_price_base_units(context) -> str:
+    params = context.get_current_parameters()
+    p_base = params.get("price_base_units")
+    p_eth = params.get("price_eth")
+    if p_eth is None and p_base is None:
+        raise ValueError("Missing financial amount: both price_eth and price_base_units are missing (price_eth is required to derive price_base_units)")
+    if p_eth is not None and p_base is not None:
+        val_bu = validate_base_units_str(p_base, field_name="price_base_units")
+        curr = params.get("currency", "ETH")
+        decs = params.get("token_decimals", 18)
+        expected = eth_amount_to_base_units_str(p_eth) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(p_eth), decimals=decs)
+        if val_bu != expected:
+            raise ValueError(
+                f"Conflicting financial values for Offer: price_eth ({p_eth} -> {expected}) "
+                f"does not match price_base_units ({val_bu})"
+            )
+        return val_bu
+    if p_eth is not None:
+        curr = params.get("currency", "ETH")
+        decs = params.get("token_decimals", 18)
+        return eth_amount_to_base_units_str(p_eth) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(p_eth), decimals=decs)
+    return validate_base_units_str(p_base, field_name="price_base_units")
+
+
+def _derive_deal_amount_base_units(context) -> str:
+    params = context.get_current_parameters()
+    a_base = params.get("amount_base_units")
+    a_eth = params.get("amount_eth")
+    if a_eth is None and a_base is None:
+        raise ValueError("Missing financial amount: both amount_eth and amount_base_units are missing (amount_eth is required to derive amount_base_units)")
+    if a_eth is not None and a_base is not None:
+        val_bu = validate_base_units_str(a_base, field_name="amount_base_units")
+        sym = params.get("token_symbol", "ETH")
+        decs = params.get("token_decimals", 18)
+        expected = eth_amount_to_base_units_str(a_eth) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(a_eth), decimals=decs)
+        if val_bu != expected:
+            raise ValueError(
+                f"Conflicting financial values for EscrowDeal: amount_eth ({a_eth} -> {expected}) "
+                f"does not match amount_base_units ({val_bu})"
+            )
+        return val_bu
+    if a_eth is not None:
+        sym = params.get("token_symbol", "ETH")
+        decs = params.get("token_decimals", 18)
+        return eth_amount_to_base_units_str(a_eth) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(a_eth), decimals=decs)
+    return validate_base_units_str(a_base, field_name="amount_base_units")
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
@@ -178,6 +234,15 @@ class Requirement(Base):
     keywords: Mapped[str | None] = mapped_column(Text, nullable=True)  # CSV for simple search
     budget_min: Mapped[float | None] = mapped_column(Numeric(20, 8), nullable=True)
     budget_max: Mapped[float | None] = mapped_column(Numeric(20, 8), nullable=True)
+
+    # Multi-token V3 fields (Phase 6.2.2.2)
+    currency: Mapped[str] = mapped_column(String(10), default="ETH", nullable=False)
+    token_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    token_decimals: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_min_base_units: Mapped[str | None] = mapped_column(String(78), nullable=True)
+    budget_max_base_units: Mapped[str | None] = mapped_column(String(78), nullable=True)
+
     status: Mapped[RequirementStatus] = mapped_column(
         Enum(RequirementStatus, name="requirement_status"),
         default=RequirementStatus.ACTIVE,
@@ -214,6 +279,18 @@ class Offer(Base):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     price_eth: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
+
+    # Multi-token V3 fields (Phase 6.2.2.2)
+    currency: Mapped[str] = mapped_column(String(10), default="ETH", nullable=False)
+    token_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    token_decimals: Mapped[int] = mapped_column(Integer, default=18, nullable=False)
+    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    price_base_units: Mapped[str] = mapped_column(
+        String(78),
+        default=_derive_offer_price_base_units,
+        nullable=False,
+    )
+
     # Unix timestamp the seller commits to deliver by (mirrors contract deadline)
     delivery_deadline: Mapped[int] = mapped_column(Integer, nullable=False)
     terms: Mapped[str] = mapped_column(Text, nullable=False)
@@ -273,6 +350,22 @@ class EscrowDeal(Base):
     # Amounts
     amount_eth: Mapped[float] = mapped_column(Numeric(20, 8), nullable=False)
 
+    # Multi-token V3 fields (Phase 6.2.2.2)
+    chain_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    token_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    token_symbol: Mapped[str] = mapped_column(String(10), default="ETH", nullable=False)
+    currency = synonym("token_symbol")
+    token_decimals: Mapped[int] = mapped_column(Integer, default=18, nullable=False)
+    amount_base_units: Mapped[str] = mapped_column(
+        String(78),
+        default=_derive_deal_amount_base_units,
+        nullable=False,
+    )
+    fee_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    treasury_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    agreement_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    previous_agreement_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
+
     # Deadline (Unix timestamp) submitted to the contract
     deadline_ts: Mapped[int] = mapped_column(Integer, nullable=False)
 
@@ -295,6 +388,214 @@ class EscrowDeal(Base):
     offer: Mapped["Offer"] = relationship(back_populates="escrow_deal")
     buyer: Mapped["User"] = relationship(back_populates="escrow_deals_as_buyer", foreign_keys=[buyer_id])
     seller: Mapped["User"] = relationship(back_populates="escrow_deals_as_seller", foreign_keys=[seller_id])
+
+
+# ─── Dual Financial Consistency Event Listeners ─────────────────────────────
+
+def _validate_offer_financials_event(mapper, connection, target: Offer) -> None:
+    p_eth = target.price_eth
+    p_base = target.price_base_units
+
+    if p_eth is None and p_base is None:
+        raise ValueError("Missing financial amount: both price_eth and price_base_units are missing (price_eth is required to derive price_base_units)")
+
+    if p_eth is not None and p_base is not None:
+        val_bu = validate_base_units_str(p_base, field_name="price_base_units")
+        curr = target.currency or "ETH"
+        decs = target.token_decimals if target.token_decimals is not None else 18
+        expected = eth_amount_to_base_units_str(p_eth) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(p_eth), decimals=decs)
+        if val_bu != expected:
+            raise ValueError(
+                f"Conflicting financial values for Offer: price_eth ({p_eth} -> {expected}) "
+                f"does not match price_base_units ({val_bu})"
+            )
+        target.price_base_units = val_bu
+    elif p_eth is not None:
+        curr = target.currency or "ETH"
+        decs = target.token_decimals if target.token_decimals is not None else 18
+        target.price_base_units = eth_amount_to_base_units_str(p_eth) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(p_eth), decimals=decs)
+    else:
+        target.price_base_units = validate_base_units_str(p_base, field_name="price_base_units")
+
+
+def _validate_deal_financials_event(mapper, connection, target: EscrowDeal) -> None:
+    a_eth = target.amount_eth
+    a_base = target.amount_base_units
+
+    if a_eth is None and a_base is None:
+        raise ValueError("Missing financial amount: both amount_eth and amount_base_units are missing (amount_eth is required to derive amount_base_units)")
+
+    if a_eth is not None and a_base is not None:
+        val_bu = validate_base_units_str(a_base, field_name="amount_base_units")
+        sym = getattr(target, "currency", None) or getattr(target, "token_symbol", None) or "ETH"
+        decs = target.token_decimals if target.token_decimals is not None else 18
+        expected = eth_amount_to_base_units_str(a_eth) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(a_eth), decimals=decs)
+        if val_bu != expected:
+            raise ValueError(
+                f"Conflicting financial values for EscrowDeal: amount_eth ({a_eth} -> {expected}) "
+                f"does not match amount_base_units ({val_bu})"
+            )
+        target.amount_base_units = val_bu
+    elif a_eth is not None:
+        sym = getattr(target, "currency", None) or getattr(target, "token_symbol", None) or "ETH"
+        decs = target.token_decimals if target.token_decimals is not None else 18
+        target.amount_base_units = eth_amount_to_base_units_str(a_eth) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(a_eth), decimals=decs)
+    else:
+        target.amount_base_units = validate_base_units_str(a_base, field_name="amount_base_units")
+
+
+event.listen(Offer, "before_insert", _validate_offer_financials_event)
+event.listen(Offer, "before_update", _validate_offer_financials_event)
+event.listen(EscrowDeal, "before_insert", _validate_deal_financials_event)
+event.listen(EscrowDeal, "before_update", _validate_deal_financials_event)
+
+
+# ─── ORM UPDATE Financial Derivation Listener ──────────────────────────────
+
+def _derive_orm_update_financials(orm_execute_state):
+    """
+    Ensures that when an ORM-level UPDATE statement modifies only one financial representation,
+    the matching counterpart is derived using authoritative metadata, preventing stale data.
+    """
+    if orm_execute_state.is_update:
+        stmt = orm_execute_state.statement
+        table = getattr(stmt, "table", None)
+        if table is not None and table.name in ("offers", "escrow_deals"):
+            stmt_values = getattr(stmt, "_values", None) or {}
+            cols = {getattr(k, "name", str(k)): v for k, v in stmt_values.items()}
+            if table.name == "offers":
+                if "price_eth" in cols and "price_base_units" not in cols:
+                    val_elem = cols["price_eth"]
+                    val = getattr(val_elem, "value", None)
+                    if val is not None:
+                        decs_elem = cols.get("token_decimals")
+                        decs = getattr(decs_elem, "value", 18) if decs_elem is not None else 18
+                        curr_elem = cols.get("currency")
+                        curr = getattr(curr_elem, "value", "ETH") if curr_elem is not None else "ETH"
+                        bu = eth_amount_to_base_units_str(val) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(val), decimals=decs)
+                        orm_execute_state.statement = stmt.values(price_base_units=bu)
+                elif "price_base_units" in cols and "price_eth" not in cols:
+                    val_elem = cols["price_base_units"]
+                    val = getattr(val_elem, "value", None)
+                    if val is not None:
+                        decs_elem = cols.get("token_decimals")
+                        decs = getattr(decs_elem, "value", 18) if decs_elem is not None else 18
+                        p_eth = float(base_units_str_to_decimal(val, decimals=decs))
+                        orm_execute_state.statement = stmt.values(price_eth=p_eth)
+            elif table.name == "escrow_deals":
+                if "amount_eth" in cols and "amount_base_units" not in cols:
+                    val_elem = cols["amount_eth"]
+                    val = getattr(val_elem, "value", None)
+                    if val is not None:
+                        decs_elem = cols.get("token_decimals")
+                        decs = getattr(decs_elem, "value", 18) if decs_elem is not None else 18
+                        sym_elem = cols.get("token_symbol") or cols.get("currency")
+                        sym = getattr(sym_elem, "value", "ETH") if sym_elem is not None else "ETH"
+                        bu = eth_amount_to_base_units_str(val) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(val), decimals=decs)
+                        orm_execute_state.statement = stmt.values(amount_base_units=bu)
+                elif "amount_base_units" in cols and "amount_eth" not in cols:
+                    val_elem = cols["amount_base_units"]
+                    val = getattr(val_elem, "value", None)
+                    if val is not None:
+                        decs_elem = cols.get("token_decimals")
+                        decs = getattr(decs_elem, "value", 18) if decs_elem is not None else 18
+                        a_eth = float(base_units_str_to_decimal(val, decimals=decs))
+                        orm_execute_state.statement = stmt.values(amount_eth=a_eth)
+
+
+event.listen(Session, "do_orm_execute", _derive_orm_update_financials)
+
+
+# ─── Core Insert Financial Consistency Event Listener ───────────────────────
+
+def _validate_core_financial_consistency(conn, clauseelement, multiparams, params, execution_options):
+    if hasattr(clauseelement, "is_insert") and (clauseelement.is_insert or clauseelement.is_update):
+        table = getattr(clauseelement, "table", None)
+        if table is not None and table.name in ("offers", "escrow_deals"):
+            param_list = []
+            if multiparams:
+                for mp in multiparams:
+                    if isinstance(mp, dict):
+                        param_list.append(mp)
+                    elif isinstance(mp, (list, tuple)):
+                        param_list.extend(mp)
+            if params:
+                param_list.append(params)
+            if not param_list:
+                compiled = clauseelement.compile()
+                if compiled.params:
+                    param_list.append(compiled.params)
+
+            stmt_values = getattr(clauseelement, "_values", None) or {}
+            stmt_cols = {getattr(k, "name", str(k)) for k in stmt_values.keys()}
+
+            for row in param_list:
+                if table.name == "offers":
+                    has_eth = ("price_eth" in stmt_cols) or ("price_eth" in row)
+                    has_base = ("price_base_units" in stmt_cols) or ("price_base_units" in row)
+
+                    if clauseelement.is_update:
+                        if has_eth and not has_base:
+                            raise ValueError(
+                                "Partial Core UPDATE of financial fields is prohibited: both price_eth and price_base_units "
+                                "must be provided in the UPDATE statement to prevent stale financial data"
+                            )
+                        if has_base and not has_eth:
+                            raise ValueError(
+                                "Partial Core UPDATE of financial fields is prohibited: both price_eth and price_base_units "
+                                "must be provided in the UPDATE statement to prevent stale financial data"
+                            )
+                        if not has_eth and not has_base:
+                            continue
+
+                    p_eth = row.get("price_eth")
+                    p_base = row.get("price_base_units")
+                    if p_eth is not None and p_base is not None:
+                        val_bu = validate_base_units_str(p_base, field_name="price_base_units")
+                        curr = row.get("currency") or "ETH"
+                        decs = row.get("token_decimals") if row.get("token_decimals") is not None else 18
+                        expected = eth_amount_to_base_units_str(p_eth) if (curr == "ETH" or decs == 18) else decimal_to_base_units_str(str(p_eth), decimals=decs)
+                        if val_bu != expected:
+                            raise ValueError(f"Conflicting financial values for Offer: price_eth ({p_eth} -> {expected}) does not match price_base_units ({val_bu})")
+                    elif clauseelement.is_update:
+                        raise ValueError("Both price_eth and price_base_units must be non-null and evaluatable when updating Offer financial fields")
+                    elif clauseelement.is_insert and p_eth is None and p_base is None:
+                        raise ValueError("Missing financial amount: both price_eth and price_base_units are missing")
+
+                elif table.name == "escrow_deals":
+                    has_eth = ("amount_eth" in stmt_cols) or ("amount_eth" in row)
+                    has_base = ("amount_base_units" in stmt_cols) or ("amount_base_units" in row)
+
+                    if clauseelement.is_update:
+                        if has_eth and not has_base:
+                            raise ValueError(
+                                "Partial Core UPDATE of financial fields is prohibited: both amount_eth and amount_base_units "
+                                "must be provided in the UPDATE statement to prevent stale financial data"
+                            )
+                        if has_base and not has_eth:
+                            raise ValueError(
+                                "Partial Core UPDATE of financial fields is prohibited: both amount_eth and amount_base_units "
+                                "must be provided in the UPDATE statement to prevent stale financial data"
+                            )
+                        if not has_eth and not has_base:
+                            continue
+
+                    a_eth = row.get("amount_eth")
+                    a_base = row.get("amount_base_units")
+                    if a_eth is not None and a_base is not None:
+                        val_bu = validate_base_units_str(a_base, field_name="amount_base_units")
+                        sym = row.get("currency") or row.get("token_symbol") or "ETH"
+                        decs = row.get("token_decimals") if row.get("token_decimals") is not None else 18
+                        expected = eth_amount_to_base_units_str(a_eth) if (sym == "ETH" or decs == 18) else decimal_to_base_units_str(str(a_eth), decimals=decs)
+                        if val_bu != expected:
+                            raise ValueError(f"Conflicting financial values for EscrowDeal: amount_eth ({a_eth} -> {expected}) does not match amount_base_units ({val_bu})")
+                    elif clauseelement.is_update:
+                        raise ValueError("Both amount_eth and amount_base_units must be non-null and evaluatable when updating EscrowDeal financial fields")
+                    elif clauseelement.is_insert and a_eth is None and a_base is None:
+                        raise ValueError("Missing financial amount: both amount_eth and amount_base_units are missing")
+
+
+event.listen(Engine, "before_execute", _validate_core_financial_consistency)
 
 
 class Conversation(Base):
@@ -483,10 +784,11 @@ class AgreementConsent(Base):
     """
     Verified cryptographic consent record for an agreement (EIP-712 signature).
     Enforces that buyer and seller independently sign the exact same canonical agreement_hash.
+    Supports versioned agreement amendments (Phase 6).
     """
     __tablename__ = "agreement_consents"
     __table_args__ = (
-        UniqueConstraint("offer_id", "party_role", name="uq_offer_party_consent"),
+        UniqueConstraint("offer_id", "party_role", "agreement_version", name="uq_offer_party_version_consent"),
         Index("ix_agreement_consents_offer", "offer_id"),
         Index("ix_agreement_consents_deal", "deal_id"),
         Index("ix_agreement_consents_hash", "agreement_hash"),
@@ -512,6 +814,15 @@ class AgreementConsent(Base):
     nonce: Mapped[str] = mapped_column(String(64), nullable=False)
     signature: Mapped[str] = mapped_column(String(132), nullable=False)
     deadline: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Multi-token V3 fields (Phase 6.2.2.2)
+    agreement_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    token_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    amount_base_units: Mapped[str | None] = mapped_column(String(78), nullable=True)
+    fee_bps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    treasury_address: Mapped[str | None] = mapped_column(String(42), nullable=True)
+    previous_agreement_hash: Mapped[str | None] = mapped_column(String(66), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )

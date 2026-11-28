@@ -13,11 +13,24 @@ from app.models.models import Offer, OfferStatus, Requirement, RequirementStatus
 from app.schemas.requirements import RequirementCreate, RequirementUpdate
 
 
+from app.config import get_settings
+from app.core.token_registry import get_token_registry
+from app.core.token_conversion import to_base_units
+
+
 async def create_requirement(
     db: AsyncSession, buyer: User, data: RequirementCreate
 ) -> Requirement:
     if buyer.primary_role != UserRole.BUYER:
         raise ValueError("Only buyers can post requirements.")
+
+    curr = (data.currency or "ETH").strip().upper()
+    registry = get_token_registry()
+    meta = registry.get_token(get_settings().chain_id, curr)
+
+    b_min_base = to_base_units(data.budget_min, meta.decimals) if data.budget_min is not None else None
+    b_max_base = to_base_units(data.budget_max, meta.decimals) if data.budget_max is not None else None
+
     req = Requirement(
         buyer_id=buyer.id,
         title=data.title,
@@ -26,6 +39,12 @@ async def create_requirement(
         keywords=data.keywords,
         budget_min=data.budget_min,
         budget_max=data.budget_max,
+        currency=meta.symbol,
+        token_address=meta.token_address,
+        token_decimals=meta.decimals,
+        chain_id=meta.chain_id,
+        budget_min_base_units=b_min_base,
+        budget_max_base_units=b_max_base,
     )
     db.add(req)
     await db.commit()

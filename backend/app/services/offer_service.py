@@ -20,6 +20,11 @@ from app.models.models import (
 from app.schemas.offers import OfferCreate, OfferUpdate
 
 
+from app.config import get_settings
+from app.core.token_registry import get_token_registry
+from app.core.token_conversion import to_base_units, from_base_units
+
+
 async def create_offer(db: AsyncSession, seller: User, data: OfferCreate) -> Offer:
     if seller.primary_role != UserRole.SELLER:
         raise ValueError("Only sellers can submit offers.")
@@ -39,12 +44,34 @@ async def create_offer(db: AsyncSession, seller: User, data: OfferCreate) -> Off
     if req.buyer_id == seller.id:
         raise ValueError("Cannot offer on your own requirement.")
 
+    curr = (data.currency or (req.currency if req.currency else "ETH")).strip().upper()
+    if req.currency and req.currency.strip().upper() != curr:
+        raise ValueError(
+            f"Offer currency '{curr}' does not match requirement currency '{req.currency}'."
+        )
+
+    registry = get_token_registry()
+    chain_id = get_settings().chain_id
+    meta = registry.get_token(chain_id, curr)
+
+    amt = data.amount if data.amount is not None else (data.price if data.price is not None else data.price_eth)
+    if amt is None:
+        raise ValueError("Price amount is required.")
+
+    base_units = to_base_units(amt, meta.decimals)
+    derived_legacy_price = float(from_base_units(base_units, meta.decimals))
+
     offer = Offer(
         requirement_id=data.requirement_id,
         seller_id=seller.id,
-        price_eth=data.price_eth,
+        price_eth=derived_legacy_price,
         delivery_deadline=data.delivery_deadline,
         terms=data.terms,
+        currency=meta.symbol,
+        token_address=meta.token_address,
+        token_decimals=meta.decimals,
+        chain_id=meta.chain_id,
+        price_base_units=base_units,
     )
     db.add(offer)
     await db.commit()
